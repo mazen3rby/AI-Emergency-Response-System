@@ -1,4 +1,4 @@
-# <div align="center">🚑 AI Emergency Response System 🚑</div>
+# <div align="center"> AI Emergency Response System 🚑</div>
 
 <div align="center">
 
