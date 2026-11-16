@@ -1,0 +1,11 @@
+# Flutter / Dart gitignore
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+*.apk
+*.zip
+android_extracted/
+flutter_extracted/
+.idea/
+*.iml
