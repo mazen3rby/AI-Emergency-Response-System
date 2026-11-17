@@ -973,6 +973,24 @@ docs/
     └── project-presentation.pdf
 ```
 
+### Mobile Emergency Module
+
+The Mobile Emergency Module is integrated into the Flutter application. It provides:
+
+- GPS & Location Services
+- Location Permissions
+- Reverse Geocoding
+- OpenStreetMap Integration
+- SOS Emergency Flow
+- Live Location Tracking
+- Emergency Session Management
+- Emergency History & Persistence
+
+Guides:
+
+- [Mobile Emergency Module Handover](MOBILE_EMERGENCY_MODULE_HANDOVER.md)
+- [Mobile Emergency Module Quick Run Guide](MOBILE_EMERGENCY_MODULE_RUN.md)
+
 ---
 
 # ⚠️ Medical Safety Disclaimer

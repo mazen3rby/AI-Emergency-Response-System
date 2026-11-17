@@ -1,4 +1,4 @@
-# Quick run guide — Person 2 mobile module
+# Mobile Emergency Module — Quick Run Guide
 
 ## Prerequisites
 - Flutter: `C:\flutter\bin\flutter.bat`
@@ -47,4 +47,4 @@ Watch the result with:
 
 Never place a real call or send a real SMS during tests. The app only opens composers; verify the snackbar text instead.
 
-See `PERSON2_HANDOVER.md` for the full audit, limitations and evidence.
+See `MOBILE_EMERGENCY_MODULE_HANDOVER.md` for the full audit, limitations and evidence.

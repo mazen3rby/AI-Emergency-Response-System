@@ -1648,7 +1648,7 @@ void showLocationOptions(
 }
 
 // ============================================================
-// EMERGENCY SOS SCREEN  ← Person 2 Main Feature
+// EMERGENCY SOS SCREEN  ← Mobile Emergency Module
 // ============================================================
 
 class EmergencySOSScreen extends StatefulWidget {
@@ -2409,7 +2409,7 @@ class _EmerNumRow extends StatelessWidget {
 }
 
 // ============================================================
-// LIVE TRACKING MAP SCREEN  ← Person 2 Feature
+// LIVE TRACKING MAP SCREEN  ← Mobile Emergency Module
 // ============================================================
 
 class LiveTrackingMapScreen extends StatefulWidget {

@@ -779,7 +779,7 @@ class NotificationService {
 }
 
 // ============================================================
-// LOCATION SOURCE TRACKING (Person 2 - GPS Source Labeling)
+// LOCATION SOURCE TRACKING (GPS Source Labeling)
 // ============================================================
 
 enum LocationSource {
@@ -820,7 +820,7 @@ class LocationResult {
 }
 
 // ============================================================
-// LIVE LOCATION SERVICE (Person 2 - Mobile Emergency Developer)
+// LIVE LOCATION SERVICE (Mobile Emergency Module)
 // ============================================================
 
 class LiveLocationService {
@@ -2390,7 +2390,7 @@ void showLocationOptions(
 }
 
 // ============================================================
-// EMERGENCY SOS SCREEN  ← Person 2 Main Feature
+// EMERGENCY SOS SCREEN  ← Mobile Emergency Module
 // ============================================================
 
 class EmergencySOSScreen extends StatefulWidget {
@@ -3336,7 +3336,7 @@ class _EmerNumRow extends StatelessWidget {
 }
 
 // ============================================================
-// LIVE TRACKING MAP SCREEN  ← Person 2 Feature
+// LIVE TRACKING MAP SCREEN  ← Mobile Emergency Module
 // ============================================================
 
 class LiveTrackingMapScreen extends StatefulWidget {

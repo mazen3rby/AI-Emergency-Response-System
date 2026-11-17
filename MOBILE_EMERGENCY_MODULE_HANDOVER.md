@@ -1,8 +1,19 @@
-# Person 2 — Mobile / GPS / Maps / SOS Handover
+# Mobile Emergency Module — Handover
 
 **Scope:** Flutter Android module (`lib/main.dart`, Android manifest, dependencies, tests).
 **Date:** 2026-11-17
-**Branch:** `master` (worktree), backup checkpoint `backup/person2-pre-audit` @ `064e9bf`.
+**Integration:** Merged into the shared `main` branch; original commit history and authorship preserved.
+
+This module covers:
+
+- GPS & Location Services
+- Location Permissions
+- Reverse Geocoding
+- OpenStreetMap Integration
+- SOS Emergency Flow
+- Live Location Tracking
+- Emergency Session Management
+- Emergency History & Persistence
 
 ---
 
@@ -45,7 +56,7 @@
 - `pubspec.yaml` / `pubspec.lock`: added `geocoding` (already declared, now resolved).
 - `analysis_options.yaml`: excludes archived extracted folders and legacy root `main.dart`; cosmetic legacy lints downgraded so `analyze` is clean.
 - `.gitignore`: ignores audit scratch artifacts (`*.dex`, `dump.txt`, screenshots, `*.log`, `apk_unpacked/`).
-- `test/person2_mobile_test.dart`: 11 tests for address formatting, coarse area labels, source labels, permission messages and session JSON.
+- `test/mobile_emergency_module_test.dart`: 11 tests for address formatting, coarse area labels, source labels, permission messages and session JSON.
 
 ---
 
