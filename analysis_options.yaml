@@ -1,0 +1,24 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  exclude:
+    # Archived/extracted copies kept for reference only — not part of the app.
+    - flutter_extracted/**
+    - android_extracted/**
+    - apk_unpacked/**
+    - build/**
+    # Legacy scratch copy; the real entry point is lib/main.dart.
+    - main.dart
+
+  # Cosmetic lints from the preserved legacy UI are downgraded on purpose:
+  # changing them would alter the original GetStarted/Home/SOS design.
+  errors:
+    deprecated_member_use: ignore
+    prefer_const_constructors: ignore
+    prefer_const_literals_to_create_immutables: ignore
+    library_private_types_in_public_api: ignore
+    prefer_conditional_assignment: ignore
+
+linter:
+  rules:
+    avoid_print: true
