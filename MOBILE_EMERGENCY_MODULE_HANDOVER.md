@@ -27,12 +27,12 @@ This module covers:
 | Source labels (`LIVE GPS`, `LAST KNOWN`, `CACHED`, `SIMULATED`, `MANUAL SELECTION`, `FALLBACK (not real)`) | **Fixed + unit-tested** | `LocationResult.sourceLabel`, `LiveLocationService.lastSourceLabel`, `metadataLine`; shown in Home, SOS, Map and FindNearest. |
 | Accuracy / time / source display | **Fixed** | `metadataLine` = `SOURCE · ±Xm · HH:MM`; SOS shows `SOURCE · address · lat, lng`. |
 | Live updates / no duplicate listeners | **Fixed** | `startTracking()` returns a client id; every screen stores and stops only its own id. One shared `StreamSubscription`. Emergency keeps its own token across navigation and stops on cancel. |
-| Reverse geocoding | **Implemented, provider unverified at runtime** | `geocoding` plugin → platform geocoder; `formatAddressLabel` priority neighborhood → street → city → governorate → country; `AddressInfo.verified=false` yields "Address unavailable (lat, lng)". `getAreaName()` is now explicitly only coarse demo metadata, never a verified address. |
-| Map engine / tiles / recenter / errors | **Implemented, runtime verification in progress** | `flutter_map` + OSM tiles, no Google Maps widget and no Maps API key. Source-aware initial center, recenter FAB, tile error flag, attribution, offline snackbar. |
+| Reverse geocoding | **Verified on emulator (mock locations)** | `geocoding` plugin → platform geocoder; `formatAddressLabel` priority neighborhood → street → city → governorate → country; `AddressInfo.verified=false` yields "Address unavailable (lat, lng)". `getAreaName()` is now explicitly only coarse demo metadata, never a verified address. |
+| Map engine / tiles / recenter / errors | **Implemented; no tile errors observed on emulator** | `flutter_map` + OSM tiles, no Google Maps widget and no Maps API key. Source-aware initial center, recenter FAB, tile error flag, attribution, offline snackbar. |
 | SOS launch honesty | **Fixed** | Dialer/SMS/WhatsApp helpers return actual launch results. No call is placed, no SMS is auto-sent, no backend dispatch is claimed. Local session is saved before/after launches with a timeline. |
 | SOS duplicate prevention | **Fixed** | Status guard + `_triggerInProgress`; active session restored when re-entering the screen. |
 | Tracking stop after resolution | **Fixed** | `_emergencyTrackToken` stopped on cancel; screen tokens stopped in `dispose`; no global `stopTracking()` from screens. |
-| History persistence / reload / clear / corruption | **Implemented; JSON tests pass** | `SharedPreferences` string list; try/catch per entry on load; `fromJson` backward-compatible with legacy entries. Runtime restart check pending. |
+| History persistence / reload / clear / corruption | **Implemented; JSON tests pass** | `SharedPreferences` string list; try/catch per entry on load; `fromJson` backward-compatible with legacy entries. Restart reload verified on emulator (§5.5). |
 | Firebase init / channels / FCM | **Code audit only** | `Firebase.initializeApp()`, local channel, foreground/background/cold-start handlers and token getter exist. Delivery/background delivery **not verified** — no server project/backend in this repo. |
 | Notifications | **Local implementation** | Channel `nabd_emergency_channel`, foreground FCM → local notification. Test notification text is now a demo, not dispatch confirmation. |
 | Offline behavior | **Implemented (code path), runtime check pending** | GPS works without internet; SOS/history local; map tile errors flagged and message shown. |
@@ -62,8 +62,8 @@ This module covers:
 
 ## 3. Dependencies & assets
 
-- Flutter SDK: `C:\flutter\bin\flutter.bat` (Flutter not on PATH in this environment).
-- Android SDK / adb: `C:\Users\hp\AppData\Local\Android\Sdk\platform-tools\adb.exe`.
+- Flutter SDK on `PATH` (verify with `flutter --version`).
+- Android SDK platform-tools (`adb`) and emulator on `PATH`, or `ANDROID_HOME` configured.
 - Key packages: `geolocator ^13.0.1`, `geocoding ^3.0.0`, `flutter_map ^8.3.2`, `latlong2 ^0.10.1`, `shared_preferences ^2.3.2`, `firebase_core ^3.6.0`, `firebase_messaging ^15.1.3`, `flutter_local_notifications ^17.2.2`, `connectivity_plus ^6.0.3`, `url_launcher ^6.3.0`.
 - Existing assets unchanged: `assets/images/onboarding_bg.png`, `nabd_logo.png`, etc. No new asset added.
 - `android/app/google-services.json` is required for Firebase build and is already present.
@@ -73,27 +73,27 @@ This module covers:
 ## 4. Run / verify instructions
 
 ```powershell
-cd C:\Users\hp\Downloads\AI-Emergency-Response-System-main
-C:\flutter\bin\flutter.bat pub get
-C:\flutter\bin\flutter.bat analyze
-C:\flutter\bin\flutter.bat test
-C:\flutter\bin\flutter.bat devices
-C:\flutter\bin\flutter.bat run -d <device-id>
+cd <repo-root>
+flutter pub get
+flutter analyze
+flutter test
+flutter devices
+flutter run -d <device-id>
 ```
 
 For a fresh emulator:
 
 ```powershell
-$emu = 'C:\Users\hp\AppData\Local\Android\Sdk\emulator\emulator.exe'
+$emu = if ($env:ANDROID_HOME) { Join-Path $env:ANDROID_HOME 'emulator\emulator.exe' } else { 'emulator' }
 & $emu -avd Medium_Phone_API_37.0 -netdelay none -netspeed full
-# in another shell:
-& 'C:\Users\hp\AppData\Local\Android\Sdk\platform-tools\adb.exe' shell getprop sys.boot_completed
+# in another shell (requires adb on PATH):
+& adb shell getprop sys.boot_completed
 ```
 
 Mock-location A–E (emulator only, never real emergency numbers):
 
 ```powershell
-$adb = 'C:\Users\hp\AppData\Local\Android\Sdk\platform-tools\adb.exe'
+$adb = 'adb'  # requires adb on PATH
 & $adb shell pm grant com.example.emergency_help android.permission.ACCESS_FINE_LOCATION
 # Helwan
 & $adb emu geo fix 31.30 29.85

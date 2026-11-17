@@ -1,33 +1,33 @@
 # Mobile Emergency Module — Quick Run Guide
 
 ## Prerequisites
-- Flutter: `C:\flutter\bin\flutter.bat`
-- Android SDK / adb: `C:\Users\hp\AppData\Local\Android\Sdk\platform-tools\adb.exe`
+- Flutter SDK on `PATH` (verify with `flutter --version`).
+- Android SDK platform-tools (`adb`) and emulator on `PATH`, or `ANDROID_HOME` configured.
 - Emulator AVD: `Medium_Phone_API_37.0` (the old `Pixel_6` AVD crashes with `Failed to protect CE key for user 0`; `Pixel_API_34` has a missing kernel file).
 
 ## Commands
 ```powershell
-cd C:\Users\hp\Downloads\AI-Emergency-Response-System-main
-C:\flutter\bin\flutter.bat pub get
-C:\flutter\bin\flutter.bat analyze      # expect: No issues found!
-C:\flutter\bin\flutter.bat test         # expect: 11/11 passed
-C:\flutter\bin\flutter.bat devices
-C:\flutter\bin\flutter.bat run -d <device-id>
+cd <repo-root>
+flutter pub get
+flutter analyze      # expect: No issues found!
+flutter test         # expect: 11/11 passed
+flutter devices
+flutter run -d <device-id>
 ```
 
 ## Emulator
 ```powershell
-$emu = 'C:\Users\hp\AppData\Local\Android\Sdk\emulator\emulator.exe'
+$emu = if ($env:ANDROID_HOME) { Join-Path $env:ANDROID_HOME 'emulator\emulator.exe' } else { 'emulator' }
 & $emu -avd Medium_Phone_API_37.0 -netdelay none -netspeed full
-# wait until this prints 1:
-& 'C:\Users\hp\AppData\Local\Android\Sdk\platform-tools\adb.exe' shell getprop sys.boot_completed
+# wait until this prints 1 (requires adb on PATH):
+& adb shell getprop sys.boot_completed
 ```
 
 ## Safe GPS checks (mock only)
 On this AVD `adb emu geo fix` did not override the Google location provider. Use the test provider instead (verified working):
 
 ```powershell
-$adb = 'C:\Users\hp\AppData\Local\Android\Sdk\platform-tools\adb.exe'
+$adb = 'adb'  # requires adb on PATH
 & $adb shell pm grant com.example.emergency_help android.permission.ACCESS_FINE_LOCATION
 & $adb shell appops set 2000 android:mock_location allow
 & $adb shell cmd location providers add-test-provider gps
