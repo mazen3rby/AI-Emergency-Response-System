@@ -743,6 +743,15 @@ Future<void> _openDirections(LatLng from, LatLng to) async {
 
 enum EmergencyStatus { idle, requesting, active, resolved }
 
+/// Single source of truth for the SOS duplicate guard. Extracted only so it can
+/// be unit-tested without opening a dialer or SMS composer.
+@visibleForTesting
+bool canTriggerSos({
+  required EmergencyStatus status,
+  required bool triggerInProgress,
+}) =>
+    status == EmergencyStatus.idle && !triggerInProgress;
+
 class EmergencySession {
   final String id;
   LatLng location; // updated by the emergency-owned GPS stream
@@ -1368,6 +1377,24 @@ class LiveLocationService {
     }
   }
 
+  /// Builds a truthful fallback result from the last observed position.
+  /// A mocked cached position must stay SIMULATED; ordinary cached positions
+  /// keep their previous [ordinarySource] label.
+  static LocationResult _lastKnownResult(LocationSource ordinarySource) {
+    final source = lastSource == LocationSource.simulated
+        ? LocationSource.simulated
+        : ordinarySource;
+    final now = DateTime.now();
+    lastSource = source;
+    lastUpdateTime = now;
+    return LocationResult(
+      position: lastKnownPosition!,
+      source: source,
+      accuracyMeters: lastAccuracyMeters,
+      timestamp: now,
+    );
+  }
+
   /// Returns the current device position with source labeling.
   /// NEVER silently returns a hardcoded fallback as "real" location.
   static Future<LocationResult?> getCurrentPositionWithSource() async {
@@ -1386,13 +1413,16 @@ class LiveLocationService {
         final cached = await Geolocator.getLastKnownPosition();
         if (cached != null) {
           lastKnownPosition = LatLng(cached.latitude, cached.longitude);
-          lastSource = LocationSource.cached;
+          lastSource = cached.isMocked
+              ? LocationSource.simulated
+              : LocationSource.cached;
+          lastAccuracyMeters = cached.accuracy;
           lastUpdateTime = DateTime.now();
           return LocationResult(
             position: lastKnownPosition!,
-            source: LocationSource.cached,
+            source: lastSource,
             accuracyMeters: cached.accuracy,
-            timestamp: DateTime.now(),
+            timestamp: lastUpdateTime!,
           );
         }
         // No cached position available, return null — do NOT fake it
@@ -1410,13 +1440,7 @@ class LiveLocationService {
         debugPrint('Nabd: ${permissionMessage(perm)}');
         // Only a previously observed position may be returned, clearly cached.
         if (lastKnownPosition != null) {
-          lastSource = LocationSource.cached;
-          return LocationResult(
-            position: lastKnownPosition!,
-            source: LocationSource.cached,
-            accuracyMeters: lastAccuracyMeters,
-            timestamp: DateTime.now(),
-          );
+          return _lastKnownResult(LocationSource.cached);
         }
         return null;
       }
@@ -1425,6 +1449,11 @@ class LiveLocationService {
       final cached = await Geolocator.getLastKnownPosition();
       if (cached != null) {
         lastKnownPosition = LatLng(cached.latitude, cached.longitude);
+        // Remember mock provenance and real accuracy for the timeout fallback.
+        lastSource = cached.isMocked
+            ? LocationSource.simulated
+            : LocationSource.lastKnown;
+        lastAccuracyMeters = cached.accuracy;
       }
 
       // 4. Try high-precision GPS with 8s timeout
@@ -1467,22 +1496,14 @@ class LiveLocationService {
         } catch (_) {
           // Fall back to cached/last known — labeled correctly
           if (lastKnownPosition != null) {
-            return LocationResult(
-              position: lastKnownPosition!,
-              source: LocationSource.lastKnown,
-              timestamp: DateTime.now(),
-            );
+            return _lastKnownResult(LocationSource.lastKnown);
           }
           return null;
         }
       }
     } catch (_) {
       if (lastKnownPosition != null) {
-        return LocationResult(
-          position: lastKnownPosition!,
-          source: LocationSource.lastKnown,
-          timestamp: DateTime.now(),
-        );
+        return _lastKnownResult(LocationSource.lastKnown);
       }
       return null;
     }
@@ -2980,7 +3001,12 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
 
   // ── Main SOS trigger ──
   Future<void> _triggerSOS() async {
-    if (_status != EmergencyStatus.idle || _triggerInProgress) return;
+    if (!canTriggerSos(
+      status: _status,
+      triggerInProgress: _triggerInProgress,
+    )) {
+      return;
+    }
     _triggerInProgress = true;
     HapticFeedback.heavyImpact();
 

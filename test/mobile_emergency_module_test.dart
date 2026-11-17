@@ -19,23 +19,35 @@ final geo.GeocodingPlatform? _originalGeocoding = geo.GeocodingPlatform.instance
 const MethodChannel _urlLauncherChannel =
     MethodChannel('plugins.flutter.io/url_launcher');
 
-Position _testPosition(double latitude, double longitude) => Position(
+Position _testPosition(
+  double latitude,
+  double longitude, {
+  double accuracy = 5,
+  bool isMocked = false,
+}) =>
+    Position(
       latitude: latitude,
       longitude: longitude,
       timestamp: DateTime.utc(2026, 11, 17, 10),
-      accuracy: 5,
+      accuracy: accuracy,
       altitude: 0,
       altitudeAccuracy: 0,
       heading: 0,
       headingAccuracy: 0,
       speed: 0,
       speedAccuracy: 0,
+      isMocked: isMocked,
     );
 
 class FakeGeolocatorPlatform extends GeolocatorPlatform {
   bool serviceEnabled = true;
   LocationPermission permission = LocationPermission.always;
   int streamRequestCount = 0;
+
+  Position? lastKnownPosition;
+  Object? currentPositionError;
+  int lastKnownCallCount = 0;
+  int currentPositionCallCount = 0;
 
   final StreamController<Position> _controller =
       StreamController<Position>.broadcast();
@@ -45,6 +57,23 @@ class FakeGeolocatorPlatform extends GeolocatorPlatform {
 
   @override
   Future<LocationPermission> checkPermission() async => permission;
+
+  @override
+  Future<Position?> getLastKnownPosition({
+    bool forceLocationManager = false,
+  }) async {
+    lastKnownCallCount++;
+    return lastKnownPosition;
+  }
+
+  @override
+  Future<Position> getCurrentPosition({
+    LocationSettings? locationSettings,
+  }) async {
+    currentPositionCallCount++;
+    if (currentPositionError != null) throw currentPositionError!;
+    return _testPosition(30, 31);
+  }
 
   @override
   Stream<Position> getPositionStream({LocationSettings? locationSettings}) {
@@ -231,6 +260,100 @@ void main() {
     });
   });
 
+  group('Cached/mock location fallback classification', () {
+    test('mocked last-known position is SIMULATED and keeps its accuracy',
+        () async {
+      final fake = FakeGeolocatorPlatform()
+        ..lastKnownPosition = _testPosition(
+          30.0444,
+          31.2357,
+          accuracy: 7.5,
+          isMocked: true,
+        )
+        ..currentPositionError = Exception('no fresh fix');
+      GeolocatorPlatform.instance = fake;
+
+      final result = await LiveLocationService.getCurrentPositionWithSource();
+
+      expect(result, isNotNull);
+      expect(result!.source, LocationSource.simulated);
+      expect(result.sourceLabel, 'SIMULATED');
+      expect(result.accuracyMeters, closeTo(7.5, 1e-9));
+      expect(fake.currentPositionCallCount, 2);
+      expect(LiveLocationService.lastSource, LocationSource.simulated);
+      expect(LiveLocationService.lastAccuracyMeters, closeTo(7.5, 1e-9));
+      expect(LiveLocationService.lastKnownPosition?.latitude, 30.0444);
+      expect(LiveLocationService.lastKnownPosition?.longitude, 31.2357);
+    });
+
+    test('non-mocked last-known position stays LAST KNOWN with accuracy',
+        () async {
+      final fake = FakeGeolocatorPlatform()
+        ..lastKnownPosition = _testPosition(30.2, 31.4, accuracy: 12)
+        ..currentPositionError = Exception('no fresh fix');
+      GeolocatorPlatform.instance = fake;
+
+      final result = await LiveLocationService.getCurrentPositionWithSource();
+
+      expect(result, isNotNull);
+      expect(result!.source, LocationSource.lastKnown);
+      expect(result.sourceLabel, 'LAST KNOWN');
+      expect(result.accuracyMeters, closeTo(12, 1e-9));
+      expect(LiveLocationService.lastSource, LocationSource.lastKnown);
+      expect(LiveLocationService.lastAccuracyMeters, closeTo(12, 1e-9));
+    });
+
+    test('service-disabled cached position stays CACHED with accuracy',
+        () async {
+      final fake = FakeGeolocatorPlatform()
+        ..serviceEnabled = false
+        ..lastKnownPosition = _testPosition(30.3, 31.5, accuracy: 9);
+      GeolocatorPlatform.instance = fake;
+
+      final result = await LiveLocationService.getCurrentPositionWithSource();
+
+      expect(result, isNotNull);
+      expect(result!.source, LocationSource.cached);
+      expect(result.accuracyMeters, closeTo(9, 1e-9));
+      expect(LiveLocationService.lastSource, LocationSource.cached);
+      expect(LiveLocationService.lastAccuracyMeters, closeTo(9, 1e-9));
+    });
+
+    test('service-disabled mocked cached position is SIMULATED', () async {
+      final fake = FakeGeolocatorPlatform()
+        ..serviceEnabled = false
+        ..lastKnownPosition = _testPosition(
+          30.4,
+          31.6,
+          accuracy: 6,
+          isMocked: true,
+        );
+      GeolocatorPlatform.instance = fake;
+
+      final result = await LiveLocationService.getCurrentPositionWithSource();
+
+      expect(result!.source, LocationSource.simulated);
+      expect(result.accuracyMeters, closeTo(6, 1e-9));
+      expect(LiveLocationService.lastSource, LocationSource.simulated);
+      expect(LiveLocationService.lastAccuracyMeters, closeTo(6, 1e-9));
+    });
+
+    test('no cached position returns null without inventing a source', () async {
+      final fake = FakeGeolocatorPlatform()
+        ..serviceEnabled = false
+        ..lastKnownPosition = null;
+      GeolocatorPlatform.instance = fake;
+
+      final result = await LiveLocationService.getCurrentPositionWithSource();
+
+      expect(result, isNull);
+      expect(fake.lastKnownCallCount, 1);
+      expect(LiveLocationService.lastSource, LocationSource.fallback);
+      expect(LiveLocationService.lastKnownPosition, isNull);
+      expect(LiveLocationService.lastAccuracyMeters, isNull);
+    });
+  });
+
   group('LiveLocationService permission messages', () {
     test('covers every geolocator permission state in this SDK version', () {
       expect(LiveLocationService.permissionMessage(LocationPermission.denied),
@@ -388,6 +511,46 @@ void main() {
       expect(state.failed, isTrue);
       state.markRecovered();
       expect(state.failed, isFalse);
+    });
+  });
+
+  group('SOS duplicate prevention', () {
+    test('the production guard allows only the first idle trigger', () {
+      expect(
+        canTriggerSos(
+          status: EmergencyStatus.idle,
+          triggerInProgress: false,
+        ),
+        isTrue,
+      );
+      expect(
+        canTriggerSos(
+          status: EmergencyStatus.idle,
+          triggerInProgress: true,
+        ),
+        isFalse,
+      );
+      expect(
+        canTriggerSos(
+          status: EmergencyStatus.requesting,
+          triggerInProgress: false,
+        ),
+        isFalse,
+      );
+      expect(
+        canTriggerSos(
+          status: EmergencyStatus.active,
+          triggerInProgress: false,
+        ),
+        isFalse,
+      );
+      expect(
+        canTriggerSos(
+          status: EmergencyStatus.resolved,
+          triggerInProgress: false,
+        ),
+        isFalse,
+      );
     });
   });
 
