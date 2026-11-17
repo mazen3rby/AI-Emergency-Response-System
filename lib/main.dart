@@ -18,11 +18,152 @@ import 'package:geocoding/geocoding.dart' as geo;
 ll.LatLng toLl(LatLng p) => ll.LatLng(p.latitude, p.longitude);
 LatLng toGMap(ll.LatLng p) => LatLng(p.latitude, p.longitude);
 
+// ── Shared OSM tile configuration (no visual changes) ─────────
+// Tracks tile failures internally so every map can reset its error state when
+// tiles load again. No attribution widget or banner is added by this helper.
+class TileLoadState {
+  bool _failed = false;
+  bool get failed => _failed;
+  void markFailed() => _failed = true;
+  void markRecovered() => _failed = false;
+}
+
+class _SuccessNotifyingImageProvider
+    extends ImageProvider<_SuccessNotifyingImageProvider> {
+  const _SuccessNotifyingImageProvider(this._delegate, this._onSuccess)
+      : _delegateKey = null;
+
+  const _SuccessNotifyingImageProvider._fromKey(
+    this._delegateKey,
+    this._onSuccess,
+  ) : _delegate = null;
+
+  // Kept dynamic because the underlying flutter_map provider has its own
+  // generic key type.
+  final dynamic _delegate;
+  final Object? _delegateKey;
+  final VoidCallback _onSuccess;
+
+  @override
+  ImageStream createStream(ImageConfiguration configuration) {
+    final stream = ImageStream();
+    stream.addListener(ImageStreamListener(
+      (_, __) => scheduleMicrotask(_onSuccess),
+      onError: (Object error, StackTrace? stackTrace) {},
+    ));
+    return stream;
+  }
+
+  @override
+  Future<_SuccessNotifyingImageProvider> obtainKey(
+    ImageConfiguration configuration,
+  ) async {
+    final delegate = _delegate;
+    if (delegate == null) return this;
+    final delegateKey = await delegate.obtainKey(configuration) as Object;
+    return _SuccessNotifyingImageProvider._fromKey(
+      delegateKey,
+      _onSuccess,
+    );
+  }
+
+  @override
+  void resolveStreamForKey(
+    ImageConfiguration configuration,
+    ImageStream stream,
+    _SuccessNotifyingImageProvider key,
+    ImageErrorListener handleError,
+  ) {
+    final delegate = _delegate;
+    final delegateKey = key._delegateKey;
+    if (delegate == null || delegateKey == null) return;
+    // Delegate to the original provider so image caching and tile decoding
+    // remain identical to the frozen UI; only the success listener is added.
+    (delegate as dynamic).resolveStreamForKey(
+      configuration,
+      stream,
+      delegateKey,
+      handleError,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is _SuccessNotifyingImageProvider &&
+      other._delegateKey == _delegateKey;
+
+  @override
+  int get hashCode => _delegateKey.hashCode;
+}
+
+class _NotifyingNetworkTileProvider extends fmap.NetworkTileProvider {
+  _NotifyingNetworkTileProvider({required this.onTileLoaded});
+
+  final VoidCallback onTileLoaded;
+
+  @override
+  ImageProvider getImage(
+    fmap.TileCoordinates coordinates,
+    fmap.TileLayer options,
+  ) {
+    return _SuccessNotifyingImageProvider(
+      super.getImage(coordinates, options),
+      onTileLoaded,
+    );
+  }
+
+  @override
+  ImageProvider getImageWithCancelLoadingSupport(
+    fmap.TileCoordinates coordinates,
+    fmap.TileLayer options,
+    Future<void> cancelLoading,
+  ) {
+    return _SuccessNotifyingImageProvider(
+      super.getImageWithCancelLoadingSupport(
+        coordinates,
+        options,
+        cancelLoading,
+      ),
+      onTileLoaded,
+    );
+  }
+}
+
+fmap.TileLayer _osmTileLayer({
+  required VoidCallback onTileError,
+  required VoidCallback onTileLoaded,
+}) {
+  return fmap.TileLayer(
+    urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    userAgentPackageName: 'com.example.emergency_help',
+    evictErrorTileStrategy: fmap.EvictErrorTileStrategy.notVisibleRespectMargin,
+    errorTileCallback: (_, __, ___) => onTileError(),
+    tileProvider: _NotifyingNetworkTileProvider(onTileLoaded: onTileLoaded),
+  );
+}
+
 // ============================================================
 // RESPONDER DATA MODEL  (Static – ready to swap with DB later)
 // ============================================================
 
 enum ResponderType { doctor, nurse, paramedic, volunteer }
+
+Map<String, dynamic> _stringKeyedMap(Object? value) {
+  if (value is Map<String, dynamic>) return value;
+  if (value is Map) {
+    return value.map((k, v) => MapEntry<String, dynamic>(k.toString(), v));
+  }
+  return <String, dynamic>{};
+}
+
+double? _finiteDouble(Object? value) {
+  if (value is num) {
+    final d = value.toDouble();
+    return d.isFinite ? d : null;
+  }
+  if (value is String) return double.tryParse(value);
+  return null;
+}
 
 class Responder {
   final String id;
@@ -61,6 +202,45 @@ class Responder {
       case ResponderType.paramedic: return 'Paramedic';
       case ResponderType.volunteer: return 'First-Aid Volunteer';
     }
+  }
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'id': id,
+        'name': name,
+        'type': type.name,
+        'specialty': specialty,
+        'lat': location.latitude,
+        'lng': location.longitude,
+        'address': address,
+        'phone': phone,
+        'available': available,
+      };
+
+  /// Restores only data that was actually saved. Missing/invalid fields are
+  /// rejected instead of fabricating responder details.
+  static Responder? fromJson(Object? raw) {
+    final j = _stringKeyedMap(raw);
+    final lat = _finiteDouble(j['lat']);
+    final lng = _finiteDouble(j['lng']);
+    final typeName = j['type'] as String?;
+    if (lat == null || lng == null || typeName == null) return null;
+    if (!ResponderType.values.any((e) => e.name == typeName)) return null;
+
+    final id = j['id'] as String?;
+    final name = j['name'] as String?;
+    final phone = j['phone'] as String?;
+    if (id == null || id.isEmpty || name == null || name.isEmpty) return null;
+
+    return Responder(
+      id: id,
+      name: name,
+      type: ResponderType.values.firstWhere((e) => e.name == typeName),
+      specialty: (j['specialty'] as String?) ?? '',
+      location: LatLng(lat, lng),
+      address: (j['address'] as String?) ?? '',
+      phone: phone ?? '',
+      available: (j['available'] as bool?) ?? true,
+    );
   }
 }
 
@@ -304,19 +484,36 @@ String formatAddressLabel({
   return parts.join(', ');
 }
 
-final Map<String, AddressInfo> _addressCache = {};
+class _CachedAddress {
+  final AddressInfo info;
+  final DateTime expiresAt;
+
+  const _CachedAddress(this.info, this.expiresAt);
+}
+
+final Map<String, _CachedAddress> _addressCache = {};
+
+@visibleForTesting
+Duration geocodeTimeout = const Duration(seconds: 5);
+
+@visibleForTesting
+Duration addressCacheTtl = const Duration(minutes: 10);
 
 /// Real reverse geocoding. `verified` is false when the platform geocoder is
-/// unavailable or returns no usable address.
+/// unavailable or returns no usable address. Failures are never cached, and
+/// successful results expire so stale addresses are not reused indefinitely.
 Future<AddressInfo> lookupAddress(LatLng loc) async {
   final key =
       '${loc.latitude.toStringAsFixed(5)},${loc.longitude.toStringAsFixed(5)}';
   final cached = _addressCache[key];
-  if (cached != null) return cached;
+  final now = DateTime.now();
+  if (cached != null && now.isBefore(cached.expiresAt)) return cached.info;
+  if (cached != null) _addressCache.remove(key);
 
   try {
-    final placemarks =
-        await geo.placemarkFromCoordinates(loc.latitude, loc.longitude);
+    final placemarks = await geo
+        .placemarkFromCoordinates(loc.latitude, loc.longitude)
+        .timeout(geocodeTimeout);
     if (placemarks.isNotEmpty) {
       final p = placemarks.first;
       final label = formatAddressLabel(
@@ -328,7 +525,10 @@ Future<AddressInfo> lookupAddress(LatLng loc) async {
       );
       if (label.isNotEmpty) {
         final info = AddressInfo(label: label, verified: true);
-        _addressCache[key] = info;
+        _addressCache[key] = _CachedAddress(
+          info,
+          now.add(addressCacheTtl),
+        );
         return info;
       }
     }
@@ -336,9 +536,9 @@ Future<AddressInfo> lookupAddress(LatLng loc) async {
     debugPrint('Nabd: reverse geocoding unavailable: $e');
   }
 
-  const unavailable = AddressInfo();
-  _addressCache[key] = unavailable;
-  return unavailable;
+  // Do not cache failures: a network outage must not permanently poison the
+  // address for this coordinate.
+  return const AddressInfo();
 }
 
 /// UI text helper. Never invents an address.
@@ -485,6 +685,19 @@ class _RespWithDist {
   const _RespWithDist(this.responder, this.distKm);
   String get distLabel =>
       distKm < 1 ? '${(distKm * 1000).round()} m' : '${distKm.toStringAsFixed(1)} km';
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'responder': responder.toJson(),
+        'distKm': distKm,
+      };
+
+  static _RespWithDist? fromJson(Object? raw) {
+    final j = _stringKeyedMap(raw);
+    final responder = Responder.fromJson(j['responder']);
+    final distKm = _finiteDouble(j['distKm']);
+    if (responder == null || distKm == null || distKm < 0) return null;
+    return _RespWithDist(responder, distKm);
+  }
 }
 
 // ── Find nearest responder of specific type (or any type) ────────────────────
@@ -515,8 +728,12 @@ Future<void> _openDirections(LatLng from, LatLng to) async {
     '&destination=${to.latitude},${to.longitude}'
     '&travelmode=driving',
   );
-  if (await canLaunchUrl(uri)) {
-    await launchUrl(uri, mode: LaunchMode.externalApplication);
+  try {
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    }
+  } catch (_) {
+    // Launcher unavailable: leave the current screen intact.
   }
 }
 
@@ -574,6 +791,8 @@ class EmergencySession {
     'accuracy': accuracyMeters,
     'address': addressLabel,
     'timeline': timeline,
+    // Full record for restoration; legacy keys are kept for backward readers.
+    'responder': assignedResponder?.toJson(),
     'responderName': assignedResponder?.responder.name,
     'responderDist': assignedResponder?.distLabel,
   };
@@ -599,6 +818,7 @@ class EmergencySession {
         (e) => e.name == j['status'],
         orElse: () => EmergencyStatus.resolved,
       ),
+      assignedResponder: _RespWithDist.fromJson(j['responder']),
     );
     return session;
   }
@@ -614,52 +834,136 @@ int? _emergencyTrackToken;
 // ── History list (saved locally, swap with DB later) ──
 final List<EmergencySession> _emergencyHistory = [];
 
+const String _historyPrefsKey = 'emergency_history';
+const String _activeSessionPrefsKey = 'emergency_active_session_id';
+
+/// All persistence goes through this tail so overlapping saves cannot interleave
+/// and leave a partially written SharedPreferences state.
+Future<void> _historyWriteTail = Future.value();
+
 // ── Add/update a session in local history ──
 // Does NOT invent a resolved status: the caller owns the real status.
-void _saveToHistory(EmergencySession session) {
+Future<void> _saveToHistory(EmergencySession session) async {
   final index = _emergencyHistory.indexWhere((s) => s.id == session.id);
   if (index >= 0) {
     _emergencyHistory[index] = session;
   } else {
     _emergencyHistory.insert(0, session); // newest first
   }
-  _persistHistory(); // SharedPreferences; local only, no backend claim
+  await _persistHistory(); // SharedPreferences; local only, no backend claim
 }
 
-// ── Phase 4: Persist history to SharedPreferences ──
-Future<void> _persistHistory() async {
-  try {
-    final prefs = await SharedPreferences.getInstance();
-    final jsonList = _emergencyHistory.map((s) => jsonEncode(s.toJson())).toList();
-    await prefs.setStringList('emergency_history', jsonList);
-    debugPrint('Nabd history: persisted ${_emergencyHistory.length} session(s)');
-  } catch (_) {}
-}
+// ── Persist history and active-session identity (serialized) ──
+Future<void> _persistHistory() {
+  final write = _historyWriteTail.then((_) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final snapshot = _emergencyHistory
+          .map((s) => jsonEncode(s.toJson()))
+          .toList(growable: false);
+      await prefs.setStringList(_historyPrefsKey, snapshot);
 
-// ── Phase 4: Load history from SharedPreferences on startup ──
-Future<void> _loadPersistedHistory() async {
-  try {
-    final prefs = await SharedPreferences.getInstance();
-    final jsonList = prefs.getStringList('emergency_history') ?? [];
-    for (final j in jsonList) {
-      try {
-        final session = EmergencySession.fromJson(jsonDecode(j) as Map<String, dynamic>);
-        _emergencyHistory.add(session);
-      } catch (_) {}
+      final active = _activeSession;
+      if (active != null && active.status != EmergencyStatus.resolved) {
+        await prefs.setString(_activeSessionPrefsKey, active.id);
+      } else {
+        await prefs.remove(_activeSessionPrefsKey);
+      }
+      debugPrint('Nabd history: persisted ${_emergencyHistory.length} session(s)');
+    } catch (e) {
+      debugPrint('Nabd history: persist failed: $e');
     }
+  });
+  _historyWriteTail = write.catchError((_) {});
+  return write;
+}
+
+// ── Load history from SharedPreferences on startup ──
+Future<void> _loadPersistedHistory() async {
+  await _historyWriteTail;
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final jsonList = prefs.getStringList(_historyPrefsKey) ?? <String>[];
+    _emergencyHistory.clear();
+
+    for (final entry in jsonList) {
+      try {
+        final decoded = jsonDecode(entry);
+        if (decoded is! Map<String, dynamic>) continue;
+        final session = EmergencySession.fromJson(decoded);
+        _emergencyHistory.add(session);
+      } catch (e) {
+        debugPrint('Nabd history: skipped malformed record: $e');
+      }
+    }
+
+    final activeId = prefs.getString(_activeSessionPrefsKey);
+    EmergencySession? orphan;
+    for (final session in _emergencyHistory) {
+      final unresolved = session.status == EmergencyStatus.active ||
+          session.status == EmergencyStatus.requesting;
+      if (!unresolved) continue;
+      if (activeId != null && session.id == activeId) {
+        orphan = session;
+        break;
+      }
+      orphan ??= session;
+    }
+
+    // No process-owned stream can survive a restart. Close any unresolved
+    // session honestly instead of implying live tracking continued.
+    _activeSession = null;
+    await prefs.remove(_activeSessionPrefsKey);
+    if (orphan != null) {
+      orphan.addEvent(
+        'App restarted — local session auto-resolved; live tracking does not '
+        'continue after process termination.',
+      );
+      orphan.status = EmergencyStatus.resolved;
+    }
+    await _persistHistory();
+
     debugPrint('Nabd history: loaded ${_emergencyHistory.length} session(s) from SharedPreferences');
-  } catch (_) {}
+  } catch (e) {
+    debugPrint('Nabd history: load failed; starting empty: $e');
+  }
 }
 
 // ============================================================
 // NOTIFICATION SERVICE
 // ============================================================
 
+Future<bool>? _firebaseInitFuture;
+
+/// Initializes Firebase at most once, unless a caller explicitly forces a
+/// retry. A failure never prevents the local-only app from starting.
+Future<bool> initializeFirebaseSafely({bool force = false}) {
+  final existing = _firebaseInitFuture;
+  if (!force && existing != null) return existing;
+  final future = _performFirebaseInitialization();
+  _firebaseInitFuture = future;
+  return future;
+}
+
+Future<bool> _performFirebaseInitialization() async {
+  try {
+    if (Firebase.apps.isEmpty) {
+      await Firebase.initializeApp();
+    }
+    return true;
+  } catch (e) {
+    debugPrint('Nabd Firebase: initialization failed; local mode continues: $e');
+    return false;
+  }
+}
+
 @pragma('vm:entry-point')
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  try {
-    await Firebase.initializeApp();
-  } catch (_) {}
+  final ready = await initializeFirebaseSafely();
+  if (!ready) return;
+  // Payloads are recorded for diagnostics only. No delivery, dispatch or ETA
+  // is claimed from a background FCM message.
+  debugPrint('Nabd Firebase: background payload received: ${message.messageId}');
 }
 
 class NotificationService {
@@ -667,11 +971,20 @@ class NotificationService {
       FlutterLocalNotificationsPlugin();
   static FirebaseMessaging? _fcm;
   static bool _initialized = false;
+  static bool _firebaseReady = false;
+  static int _nextNotificationId = 0;
 
-  static Future<void> init() async {
+  /// Last permission status returned by FCM. Null when Firebase is unavailable.
+  static String? permissionStatus;
+
+  /// Last payloads handled locally. They are records, not delivery receipts.
+  static Map<String, dynamic>? lastNotificationPayload;
+  static Map<String, dynamic>? initialNotificationPayload;
+
+  static Future<void> init({required bool firebaseReady}) async {
     if (_initialized) return;
 
-    // Local notifications setup
+    // Local notifications setup — independent of Firebase availability.
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
     const ios = DarwinInitializationSettings(
       requestAlertPermission: true,
@@ -695,40 +1008,67 @@ class NotificationService {
             AndroidFlutterLocalNotificationsPlugin>()
         ?.createNotificationChannel(channel);
 
-    // Firebase Messaging
+    if (firebaseReady) {
+      await _configureFirebaseMessaging();
+    } else {
+      debugPrint('Nabd Firebase: skipped messaging setup; local notifications only');
+    }
+
+    _initialized = true;
+  }
+
+  static Future<void> _configureFirebaseMessaging() async {
     try {
       _fcm = FirebaseMessaging.instance;
       FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
-      await _fcm!.requestPermission(
+
+      final settings = await _fcm!.requestPermission(
         alert: true,
         badge: true,
         sound: true,
       );
+      permissionStatus = settings.authorizationStatus.name;
 
-      // Handle foreground messages
-      FirebaseMessaging.onMessage.listen((RemoteMessage msg) {
-        _showLocal(
-          title: msg.notification?.title ?? 'Emergency Alert',
-          body:  msg.notification?.body  ?? '',
-        );
-      });
+      FirebaseMessaging.onMessage.listen(_handleForegroundMessage);
+      FirebaseMessaging.onMessageOpenedApp.listen(
+        (msg) => _recordPayload(msg, 'openedApp'),
+      );
 
-      // Phase 3: Handle notification tap when app is in background
-      FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage msg) {
-        // Log the tap — navigation can be wired later when routing is centralized
-        debugPrint('Nabd: notification tapped from background: ${msg.messageId}');
-      });
-
-      // Phase 3: Handle notification tap from terminated (cold start)
-      final initialMsg = await FirebaseMessaging.instance.getInitialMessage();
+      final initialMsg = await _fcm!.getInitialMessage();
       if (initialMsg != null) {
-        debugPrint('Nabd: app opened via notification (cold start): ${initialMsg.messageId}');
+        initialNotificationPayload = _payloadOf(initialMsg, 'coldStart');
       }
-    } catch (_) {
-      // Firebase not configured yet – local notifications still work
+      _firebaseReady = true;
+    } catch (e) {
+      // Firebase is optional: local notifications and the local SOS record
+      // continue to work even when messaging is not configured.
+      debugPrint('Nabd Firebase: messaging setup failed; local mode continues: $e');
+      _fcm = null;
+      _firebaseReady = false;
     }
+  }
 
-    _initialized = true;
+  static Map<String, dynamic> _payloadOf(RemoteMessage msg, String source) =>
+      <String, dynamic>{
+        'source': source,
+        'messageId': msg.messageId,
+        'title': msg.notification?.title,
+        'body': msg.notification?.body,
+        'data': Map<String, dynamic>.from(msg.data),
+      };
+
+  static void _recordPayload(RemoteMessage msg, String source) {
+    lastNotificationPayload = _payloadOf(msg, source);
+    debugPrint('Nabd Firebase: payload stored from $source; '
+        'delivery and dispatch are not confirmed');
+  }
+
+  static void _handleForegroundMessage(RemoteMessage msg) {
+    _recordPayload(msg, 'foreground');
+    unawaited(_showLocal(
+      title: msg.notification?.title ?? 'Emergency Alert',
+      body: msg.notification?.body ?? '',
+    ));
   }
 
   static Future<void> showEmergencyAlert({
@@ -736,10 +1076,11 @@ class NotificationService {
     required String body,
   }) => _showLocal(title: title, body: body);
 
+  /// Neutralized demo entry point. It never claims a responder or ETA.
   static Future<void> showTestNotification() async {
     await showEmergencyAlert(
-      title: '🚨 Nabd Emergency Alert System',
-      body: 'Rapid Response Unit dispatched to your live location. ETA: 3 mins.',
+      title: 'Nabd local test notification',
+      body: 'Local test only — no responder dispatched and no delivery confirmed.',
     );
   }
 
@@ -747,8 +1088,11 @@ class NotificationService {
     required String title,
     required String body,
   }) async {
+    // Microseconds plus a monotonic counter avoid same-second notification ID
+    // collisions in the Android tray.
+    final id = DateTime.now().microsecondsSinceEpoch + _nextNotificationId++;
     await _local.show(
-      DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      id,
       title,
       body,
       const NotificationDetails(
@@ -769,13 +1113,30 @@ class NotificationService {
     );
   }
 
+  /// Returns a token only after successful Firebase + messaging setup.
+  /// The token is never sent to a backend from this module.
   static Future<String?> getToken() async {
+    if (!_firebaseReady || _fcm == null) return null;
     try {
-      return await _fcm?.getToken();
+      return await _fcm!.getToken();
     } catch (_) {
       return null;
     }
   }
+
+  static void resetForTesting() {
+    _initialized = false;
+    _firebaseReady = false;
+    _fcm = null;
+    _nextNotificationId = 0;
+    permissionStatus = null;
+    lastNotificationPayload = null;
+    initialNotificationPayload = null;
+  }
+
+  @visibleForTesting
+  static void handlePayloadForTesting(RemoteMessage message) =>
+      _recordPayload(message, 'test');
 }
 
 // ============================================================
@@ -827,6 +1188,12 @@ class LiveLocationService {
   static StreamSubscription<Position>? _sub;
   static final Map<int, void Function(LatLng)> _clients = {};
   static int _nextClientId = 0;
+  static bool _streamSyncing = false;
+
+  /// Internal health state. No UI is driven directly from these fields except
+  /// the existing LIVE badge on the live-tracking screen.
+  static Object? lastStreamError;
+  static bool get streamHealthy => lastStreamError == null && _sub != null;
 
   static LatLng? lastKnownPosition;
   static LatLng? customSelectedPosition;
@@ -869,6 +1236,9 @@ class LiveLocationService {
     lastAccuracyMeters = null;
     lastUpdateTime = DateTime.now();
     lastAddressInfo = null;
+    // A manually selected point must never be overwritten by an old live
+    // stream while it is active.
+    unawaited(_syncTrackingStream());
     for (final client in _clients.values.toList()) {
       client(loc);
     }
@@ -877,6 +1247,14 @@ class LiveLocationService {
   static void clearCustomLocation() {
     customSelectedPosition = null;
     customSelectedLabel = null;
+    // Clear every value derived from the manual point so it cannot later be
+    // presented as CACHED or LAST KNOWN GPS.
+    lastKnownPosition = null;
+    lastSource = LocationSource.fallback;
+    lastAccuracyMeters = null;
+    lastUpdateTime = null;
+    lastAddressInfo = null;
+    unawaited(_syncTrackingStream());
   }
 
   /// Starts (or joins) the single shared GPS stream.
@@ -888,22 +1266,13 @@ class LiveLocationService {
     debugPrint('Nabd GPS: start client=$id total=${_clients.length}');
     if (customSelectedPosition != null) {
       onUpdate(customSelectedPosition!);
-      return id;
     }
-    if (_sub == null) {
-      _sub = Geolocator.getPositionStream(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-          distanceFilter: 5, // meters — battery-aware
-        ),
-      ).listen(_emit, onError: (e) {
-        debugPrint('Nabd GPS stream error: $e');
-      });
-    }
+    unawaited(_syncTrackingStream());
     return id;
   }
 
   static void _emit(Position pos) {
+    lastStreamError = null;
     lastKnownPosition = LatLng(pos.latitude, pos.longitude);
     lastSource = pos.isMocked ? LocationSource.simulated : LocationSource.liveGps;
     lastAccuracyMeters = pos.accuracy;
@@ -923,9 +1292,63 @@ class LiveLocationService {
       _clients.remove(clientId);
     }
     debugPrint('Nabd GPS: stop client=$clientId remaining=${_clients.length}');
-    if (_clients.isEmpty) {
-      _sub?.cancel();
+    unawaited(_syncTrackingStream());
+  }
+
+  /// Re-attempts the shared stream after a permission/service error.
+  /// Existing client ids are preserved.
+  static Future<void> retryStream() async {
+    lastStreamError = null;
+    await _sub?.cancel();
+    _sub = null;
+    await _syncTrackingStream();
+  }
+
+  static Future<void> _syncTrackingStream() async {
+    if (_streamSyncing) return;
+    _streamSyncing = true;
+    try {
+      if (customSelectedPosition != null || _clients.isEmpty) {
+        await _sub?.cancel();
+        _sub = null;
+        return;
+      }
+      if (_sub != null) return;
+
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        lastStreamError = 'Location service disabled';
+        return;
+      }
+      final permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        lastStreamError = 'Location permission denied';
+        return;
+      }
+
+      lastStreamError = null;
+      _sub = Geolocator.getPositionStream(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          distanceFilter: 5, // meters — battery-aware
+        ),
+      ).listen(_emit, onError: (Object e) {
+        lastStreamError = e;
+        final failedSub = _sub;
+        _sub = null;
+        if (failedSub != null) {
+          unawaited(failedSub.cancel().then((_) {}));
+        }
+        debugPrint('Nabd GPS stream error: $e');
+      });
+    } catch (e) {
+      lastStreamError = e;
+      await _sub?.cancel();
       _sub = null;
+      debugPrint('Nabd GPS stream setup error: $e');
+    } finally {
+      _streamSyncing = false;
     }
   }
 
@@ -1246,23 +1669,27 @@ Future<bool> _sendEmergencyWhatsApp(LatLng location) async {
   }
 }
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const EmergencyHelpApp());
-  // Asynchronous background service setup so app launches instantly in < 1 second
-  _initBackgroundServices();
-}
 
-void _initBackgroundServices() async {
-  // Phase 4: Load persisted emergency history first
+  // Load local history before the first frame when safe. Failures are handled
+  // inside _loadPersistedHistory, so they never block app startup.
   await _loadPersistedHistory();
 
+  runApp(const EmergencyHelpApp());
+
+  // Firebase and notifications are initialized after the first frame, but in a
+  // strict order: Firebase first, then messaging setup inside NotificationService.
+  unawaited(_initBackgroundServices());
+}
+
+Future<void> _initBackgroundServices() async {
+  final firebaseReady = await initializeFirebaseSafely();
   try {
-    await Firebase.initializeApp();
-  } catch (_) {}
-  try {
-    await NotificationService.init();
-  } catch (_) {}
+    await NotificationService.init(firebaseReady: firebaseReady);
+  } catch (e) {
+    debugPrint('Nabd notifications: local setup failed; app continues: $e');
+  }
 }
 
 class EmergencyHelpApp extends StatelessWidget {
@@ -1451,6 +1878,7 @@ class _HomeContentState extends State<HomeContent> {
   bool _hasRealLocation = false; // Track whether we have real GPS
   bool _isLocating = false;
   final fmap.MapController _previewMapController = fmap.MapController();
+  final TileLoadState _previewTiles = TileLoadState();
   int? _trackingId;
   // Phase 6: Offline detection
   bool _isOffline = false;
@@ -1788,7 +2216,10 @@ class _HomeContentState extends State<HomeContent> {
                 borderRadius: BorderRadius.circular(20),
                 child: InkWell(
                   borderRadius: BorderRadius.circular(20),
-                  onTap: () => showLocationOptions(context),
+                  onTap: () => showLocationOptions(
+                    context,
+                    onUseCurrentLocation: _fetchLocation,
+                  ),
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 12),
                     decoration: BoxDecoration(
@@ -1872,9 +2303,17 @@ class _HomeContentState extends State<HomeContent> {
                                 ),
                               ),
                               children: [
-                                fmap.TileLayer(
-                                  urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                                  userAgentPackageName: 'com.example.emergency_help',
+                                _osmTileLayer(
+                                  onTileError: () {
+                                    if (mounted && !_previewTiles.failed) {
+                                      setState(() => _previewTiles.markFailed());
+                                    }
+                                  },
+                                  onTileLoaded: () {
+                                    if (mounted && _previewTiles.failed) {
+                                      setState(() => _previewTiles.markRecovered());
+                                    }
+                                  },
                                 ),
                                 fmap.MarkerLayer(
                                   markers: [
@@ -2602,7 +3041,7 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
     );
     session.addEvent('SOS pressed · ${result.sourceLabel} · $addressLabel');
     _activeSession = session;
-    _saveToHistory(session);
+    await _saveToHistory(session);
 
     // 4. Open dialer. We do NOT place the call — the user must complete it.
     final dialerOpened = await _openDialer('123');
@@ -2625,7 +3064,7 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
     session.addEvent(smsOpened
         ? 'SMS composer opened with location link (not auto-sent)'
         : 'SMS app unavailable — location saved locally');
-    _saveToHistory(session);
+    await _saveToHistory(session);
     debugPrint('Nabd SOS: loc=${loc.latitude.toStringAsFixed(5)},'
         '${loc.longitude.toStringAsFixed(5)} source=${result.sourceLabel} '
         'accuracy=${result.accuracyMeters?.round()}m '
@@ -2635,6 +3074,7 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
     // 6. Activate session and start ONE tracked GPS client owned by this SOS.
     session.status = EmergencyStatus.active;
     session.addEvent('Emergency active locally — no backend delivery confirmed');
+    await _saveToHistory(session);
     if (_emergencyTrackToken != null) {
       LiveLocationService.stopTracking(_emergencyTrackToken);
     }
@@ -2643,7 +3083,7 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
       if ((_haversineKm(session.location, newLoc) * 1000) > 20) {
         session.location = newLoc;
         session.addEvent('Location updated · ${LiveLocationService.lastSourceLabel}');
-        _saveToHistory(session);
+        unawaited(_saveToHistory(session));
       }
     });
 
@@ -2717,13 +3157,14 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
         _emergencyTrackToken = null;
       }
       final session = _activeSession;
+      // Clear identity before persisting so the active-session key is removed.
+      _activeSession = null;
       if (session != null) {
         session.addEvent('Emergency cancelled by user');
         session.status = EmergencyStatus.resolved;
         session.assignedResponder = null;
-        _saveToHistory(session);
+        await _saveToHistory(session);
       }
-      _activeSession = null;
       setState(() {
         _status        = EmergencyStatus.idle;
         _statusMessage = 'Emergency cancelled. Local record kept in history.';
@@ -2866,10 +3307,10 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
               const SizedBox(height: 12),
               Text(
                 _status == EmergencyStatus.idle
-                    ? 'Tap to send emergency alert'
+                    ? 'Tap to record SOS and open dialer'
                     : _status == EmergencyStatus.requesting
                         ? 'Please wait…'
-                        : 'Emergency services notified',
+                        : 'SOS recorded locally — complete the call to 123',
                 style: TextStyle(
                     color: Colors.white.withOpacity(.5),
                     fontSize: 13),
@@ -3306,7 +3747,7 @@ class _EmerNumRow extends StatelessWidget {
                 style: const TextStyle(color: Colors.white70, fontSize: 13)),
           ),
           GestureDetector(
-            onTap: () => launchUrl(Uri(scheme: 'tel', path: number)),
+            onTap: () => _openDialer(number),
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
               decoration: BoxDecoration(
@@ -3358,8 +3799,13 @@ class _LiveTrackingMapScreenState extends State<LiveTrackingMapScreen> {
 
   final fmap.MapController _fmapCtrl = fmap.MapController();
   LatLng?              _liveLocation;
-  final bool           _tracking = true;
+  // The existing badge is kept exactly as-is; its state now reflects a real
+  // live stream instead of being permanently true.
+  bool get _tracking =>
+      LiveLocationService.lastSource == LocationSource.liveGps &&
+      LiveLocationService.streamHealthy;
   int?                 _trackingClientId;
+  final TileLoadState  _tileLoadState = TileLoadState();
 
   @override
   void initState() {
@@ -3416,7 +3862,7 @@ class _LiveTrackingMapScreenState extends State<LiveTrackingMapScreen> {
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Text(
-                  getAreaName(_liveLocation!),
+                  'Approx. ${getAreaName(_liveLocation!)}',
                   style: const TextStyle(fontSize: 11, color: Colors.white70),
                 ),
               ),
@@ -3442,9 +3888,17 @@ class _LiveTrackingMapScreenState extends State<LiveTrackingMapScreen> {
                 initialZoom: 14.5,
               ),
               children: [
-                fmap.TileLayer(
-                  urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                  userAgentPackageName: 'com.example.emergency_help',
+                _osmTileLayer(
+                  onTileError: () {
+                    if (mounted && !_tileLoadState.failed) {
+                      setState(() => _tileLoadState.markFailed());
+                    }
+                  },
+                  onTileLoaded: () {
+                    if (mounted && _tileLoadState.failed) {
+                      setState(() => _tileLoadState.markRecovered());
+                    }
+                  },
                 ),
                 fmap.PolylineLayer(
                   polylines: [
@@ -3620,12 +4074,8 @@ class _LiveTrackingMapScreenState extends State<LiveTrackingMapScreen> {
                     children: [
                       Expanded(
                         child: OutlinedButton.icon(
-                          onPressed: () async {
-                            final uri = Uri(
-                                scheme: 'tel',
-                                path: widget.responder.responder.phone);
-                            await launchUrl(uri);
-                          },
+                          onPressed: () =>
+                              _openDialer(widget.responder.responder.phone),
                           style: OutlinedButton.styleFrom(
                             foregroundColor: const Color(0xFF4CAF50),
                             side: const BorderSide(
@@ -4007,7 +4457,9 @@ class _NearbyHelpScreenState extends State<NearbyHelpScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final areaName = _userLocation != null ? getAreaName(_userLocation!) : 'Your Location';
+    final areaName = _userLocation != null
+        ? 'Approx. ${getAreaName(_userLocation!)}'
+        : 'Your Location';
     return Scaffold(
       backgroundColor: const Color(0xFFFFF9FA),
       appBar: AppBar(
@@ -4290,11 +4742,7 @@ class _ResponderCard extends StatelessWidget {
                       const SizedBox(width: 8),
                       // call button
                       InkWell(
-                        onTap: () async {
-                          final uri =
-                              Uri(scheme: 'tel', path: r.phone);
-                          await launchUrl(uri);
-                        },
+                        onTap: () => _openDialer(r.phone),
                         borderRadius: BorderRadius.circular(12),
                         child: Container(
                           padding: const EdgeInsets.all(8),
@@ -4343,6 +4791,7 @@ class _NearbyResponderMapScreenState
   static const Color brandRed = Color(0xFFE92335);
 
   final fmap.MapController _fmapCtrl = fmap.MapController();
+  final TileLoadState _tileLoadState = TileLoadState();
   _RespWithDist? _selected;
 
   @override
@@ -4375,9 +4824,17 @@ class _NearbyResponderMapScreenState
               initialZoom: 14.5,
             ),
             children: [
-              fmap.TileLayer(
-                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                userAgentPackageName: 'com.example.emergency_help',
+              _osmTileLayer(
+                onTileError: () {
+                  if (mounted && !_tileLoadState.failed) {
+                    setState(() => _tileLoadState.markFailed());
+                  }
+                },
+                onTileLoaded: () {
+                  if (mounted && _tileLoadState.failed) {
+                    setState(() => _tileLoadState.markRecovered());
+                  }
+                },
               ),
               if (_selected != null)
                 fmap.PolylineLayer(
@@ -4588,12 +5045,8 @@ class _NearbyResponderMapScreenState
                         // Call button
                         Expanded(
                           child: OutlinedButton.icon(
-                            onPressed: () async {
-                              final uri = Uri(
-                                  scheme: 'tel',
-                                  path: _selected!.responder.phone);
-                              await launchUrl(uri);
-                            },
+                            onPressed: () =>
+                                _openDialer(_selected!.responder.phone),
                             style: OutlinedButton.styleFrom(
                               foregroundColor: const Color(0xFF2E7D32),
                               side: const BorderSide(
@@ -4788,8 +5241,8 @@ class MapScreen extends StatefulWidget {
 
 class _MapScreenState extends State<MapScreen> {
   final fmap.MapController _mapController = fmap.MapController();
+  final TileLoadState _tileLoadState = TileLoadState();
   bool _loadingLocation = false;
-  bool _tilesFailed = false;
   ll.LatLng? _currentPosition;
   String _addressLabel = 'Resolving address…';
   String _metadata = '';
@@ -4913,10 +5366,7 @@ class _MapScreenState extends State<MapScreen> {
                       ),
                       icon: const Icon(Icons.phone_rounded, size: 18),
                       label: const Text('Call Now', style: TextStyle(fontWeight: FontWeight.bold)),
-                      onPressed: () async {
-                        final uri = Uri(scheme: 'tel', path: r.phone);
-                        await launchUrl(uri);
-                      },
+                      onPressed: () => _openDialer(r.phone),
                     ),
                   ),
                   const SizedBox(width: 10),
@@ -4931,8 +5381,14 @@ class _MapScreenState extends State<MapScreen> {
                       icon: const Icon(Icons.directions_rounded, size: 18),
                       label: const Text('Directions', style: TextStyle(fontWeight: FontWeight.bold)),
                       onPressed: () async {
-                        final uri = Uri.parse('https://www.google.com/maps/dir/?api=1&destination=${r.location.latitude},${r.location.longitude}');
-                        await launchUrl(uri, mode: LaunchMode.externalApplication);
+                        try {
+                          final uri = Uri.parse('https://www.google.com/maps/dir/?api=1&destination=${r.location.latitude},${r.location.longitude}');
+                          if (await canLaunchUrl(uri)) {
+                            await launchUrl(uri, mode: LaunchMode.externalApplication);
+                          }
+                        } catch (_) {
+                          // Launcher unavailable: leave the current screen intact.
+                        }
                       },
                     ),
                   ),
@@ -5065,13 +5521,15 @@ class _MapScreenState extends State<MapScreen> {
               initialZoom: 14.5,
             ),
             children: [
-              fmap.TileLayer(
-                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                userAgentPackageName: 'com.example.emergency_help',
-                evictErrorTileStrategy: fmap.EvictErrorTileStrategy.notVisibleRespectMargin,
-                errorTileCallback: (_, __, ___) {
-                  if (mounted && !_tilesFailed) {
-                    setState(() => _tilesFailed = true);
+              _osmTileLayer(
+                onTileError: () {
+                  if (mounted && !_tileLoadState.failed) {
+                    setState(() => _tileLoadState.markFailed());
+                  }
+                },
+                onTileLoaded: () {
+                  if (mounted && _tileLoadState.failed) {
+                    setState(() => _tileLoadState.markRecovered());
                   }
                 },
               ),
@@ -5209,7 +5667,7 @@ class _MapScreenState extends State<MapScreen> {
               ),
             ),
           ),
-          if (_tilesFailed)
+          if (_tileLoadState.failed)
             Positioned(
               left: 16,
               top: 130,
@@ -5308,6 +5766,7 @@ class _FindNearestScreenState extends State<FindNearestScreen>
   ResponderType?   _filterType;  // null = all types
 
   final fmap.MapController _fmapCtrl = fmap.MapController();
+  final TileLoadState _tileLoadState = TileLoadState();
   late AnimationController _pulseCtrl;
   late Animation<double>   _pulseAnim;
 
@@ -5560,9 +6019,17 @@ class _FindNearestScreenState extends State<FindNearestScreen>
                           initialZoom: 14.5,
                         ),
                         children: [
-                          fmap.TileLayer(
-                            urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                            userAgentPackageName: 'com.example.emergency_help',
+                          _osmTileLayer(
+                            onTileError: () {
+                              if (mounted && !_tileLoadState.failed) {
+                                setState(() => _tileLoadState.markFailed());
+                              }
+                            },
+                            onTileLoaded: () {
+                              if (mounted && _tileLoadState.failed) {
+                                setState(() => _tileLoadState.markRecovered());
+                              }
+                            },
                           ),
                           if (_userLoc != null && _nearest != null)
                             fmap.PolylineLayer(
@@ -5755,12 +6222,8 @@ class _FindNearestScreenState extends State<FindNearestScreen>
                           children: [
                             Expanded(
                               child: OutlinedButton.icon(
-                                onPressed: () async {
-                                  final uri = Uri(
-                                      scheme: 'tel',
-                                      path: _nearest!.responder.phone);
-                                  await launchUrl(uri);
-                                },
+                                onPressed: () =>
+                                    _openDialer(_nearest!.responder.phone),
                                 style: OutlinedButton.styleFrom(
                                   foregroundColor: const Color(0xFF4CAF50),
                                   side: const BorderSide(
@@ -5851,6 +6314,20 @@ class _HistoryScreenState extends State<HistoryScreen> {
   static const Color darkText   = Color(0xFF202329);
   static const Color mutedText  = Color(0xFF777E82);
 
+  final TileLoadState _historyTiles = TileLoadState();
+
+  void _markHistoryTilesFailed() {
+    if (mounted && !_historyTiles.failed) {
+      setState(() => _historyTiles.markFailed());
+    }
+  }
+
+  void _markHistoryTilesRecovered() {
+    if (mounted && _historyTiles.failed) {
+      setState(() => _historyTiles.markRecovered());
+    }
+  }
+
   // Format DateTime to readable string
   String _formatDate(DateTime dt) {
     final months = [
@@ -5918,11 +6395,14 @@ class _HistoryScreenState extends State<HistoryScreen> {
                         style: ElevatedButton.styleFrom(
                             backgroundColor: brandRed,
                             foregroundColor: Colors.white),
-                        onPressed: () {
-                          setState(() => _emergencyHistory.clear());
-                          // Phase 4: also clear from SharedPreferences
-                          _persistHistory();
-                          Navigator.pop(context);
+                        onPressed: () async {
+                          final navigator = Navigator.of(context);
+                          _emergencyHistory.clear();
+                          // Also clear the active-session identity on disk.
+                          _activeSession = null;
+                          await _persistHistory();
+                          if (mounted) setState(() {});
+                          navigator.pop();
                         },
                         child: const Text('Clear All'),
                       ),
@@ -6169,6 +6649,8 @@ class _HistoryScreenState extends State<HistoryScreen> {
                         MaterialPageRoute(
                           builder: (_) => _HistoryMapView(
                             session: session,
+                            onTileError: _markHistoryTilesFailed,
+                            onTileLoaded: _markHistoryTilesRecovered,
                           ),
                         ),
                       );
@@ -6191,12 +6673,8 @@ class _HistoryScreenState extends State<HistoryScreen> {
                   // Call responder
                   Expanded(
                     child: ElevatedButton.icon(
-                      onPressed: () async {
-                        final uri = Uri(
-                            scheme: 'tel',
-                            path: responder.responder.phone);
-                        await launchUrl(uri);
-                      },
+                      onPressed: () =>
+                          _openDialer(responder.responder.phone),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: const Color(0xFF1B5E20),
                         foregroundColor: Colors.white,
@@ -6224,7 +6702,14 @@ class _HistoryScreenState extends State<HistoryScreen> {
 // ── History Map View ─────────────────────────────────────────
 class _HistoryMapView extends StatelessWidget {
   final EmergencySession session;
-  const _HistoryMapView({required this.session});
+  final VoidCallback? onTileError;
+  final VoidCallback? onTileLoaded;
+
+  const _HistoryMapView({
+    required this.session,
+    this.onTileError,
+    this.onTileLoaded,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -6234,7 +6719,7 @@ class _HistoryMapView extends StatelessWidget {
         position: session.location,
         infoWindow: const InfoWindow(
           title: '🚨 Emergency Location',
-          snippet: 'Your SOS was sent from here',
+          snippet: 'SOS location recorded on this device',
         ),
         icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed),
       ),
@@ -6268,9 +6753,9 @@ class _HistoryMapView extends StatelessWidget {
           initialZoom: 14.5,
         ),
         children: [
-          fmap.TileLayer(
-            urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-            userAgentPackageName: 'com.example.emergency_help',
+          _osmTileLayer(
+            onTileError: () => onTileError?.call(),
+            onTileLoaded: () => onTileLoaded?.call(),
           ),
           fmap.MarkerLayer(
             markers: [
@@ -6874,4 +7359,42 @@ class MapPainter
       ) {
     return false;
   }
+}
+
+// ============================================================
+// TEST HOOKS (no UI behavior)
+// ============================================================
+
+@visibleForTesting
+_RespWithDist assignedResponderForTesting(Responder responder, double distKm) =>
+    _RespWithDist(responder, distKm);
+
+@visibleForTesting
+Future<bool> openDialerForTesting(String number) => _openDialer(number);
+
+@visibleForTesting
+Future<bool> sendEmergencySmsForTesting(LatLng location) =>
+    _sendEmergencySMS(location);
+
+@visibleForTesting
+Future<void> loadPersistedHistoryForTesting() => _loadPersistedHistory();
+
+@visibleForTesting
+void setActiveSessionForTesting(EmergencySession? session) =>
+    _activeSession = session;
+
+@visibleForTesting
+Future<void> persistHistoryForTesting() => _persistHistory();
+
+@visibleForTesting
+List<EmergencySession> get emergencySessionsForTesting =>
+    List<EmergencySession>.unmodifiable(_emergencyHistory);
+
+@visibleForTesting
+void clearEmergencyStateForTesting() {
+  _emergencyHistory.clear();
+  _activeSession = null;
+  _historyWriteTail = Future.value();
+  _addressCache.clear();
+  LiveLocationService.lastStreamError = null;
 }
