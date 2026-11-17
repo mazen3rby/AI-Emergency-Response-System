@@ -9,3 +9,11 @@ android_extracted/
 flutter_extracted/
 .idea/
 *.iml
+
+# Person 2 audit scratch artifacts — never commit
+apk_unpacked/
+*.dex
+dump.txt
+drawer.png
+emulator_screen.png
+*.log

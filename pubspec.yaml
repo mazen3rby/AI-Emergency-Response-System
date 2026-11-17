@@ -22,6 +22,7 @@ dependencies:
   latlong2: ^0.10.1
   shared_preferences: ^2.3.2
   connectivity_plus: ^6.0.3
+  geocoding: ^3.0.0
 
 dev_dependencies:
   flutter_test:

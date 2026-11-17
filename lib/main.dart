@@ -13,6 +13,7 @@ import 'package:flutter_map/flutter_map.dart' as fmap;
 import 'package:latlong2/latlong.dart' as ll;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:geocoding/geocoding.dart' as geo;
 
 ll.LatLng toLl(LatLng p) => ll.LatLng(p.latitude, p.longitude);
 LatLng toGMap(ll.LatLng p) => LatLng(p.latitude, p.longitude);
@@ -260,6 +261,93 @@ double _haversineKm(LatLng a, LatLng b) {
 
 double _deg2rad(double deg) => deg * pi / 180;
 
+// ── Reverse geocoding (separate from GPS) ─────────────────────
+// Provider: the `geocoding` package, which delegates to the platform geocoder
+// (Android Geocoder). It may require network access; GPS does not.
+//
+// IMPORTANT: a bounding-box name from getAreaName() is coarse demo metadata.
+// It must NEVER be presented as a verified reverse-geocoded address.
+class AddressInfo {
+  final String? label;
+  final bool verified;
+
+  const AddressInfo({this.label, this.verified = false});
+
+  bool get hasAddress => verified && label != null && label!.isNotEmpty;
+
+  String displayFor(LatLng loc) => hasAddress
+      ? label!
+      : 'Address unavailable (${loc.latitude.toStringAsFixed(4)}, '
+          '${loc.longitude.toStringAsFixed(4)})';
+}
+
+/// Pure helper: most specific -> least specific, no duplicates, no invention.
+String formatAddressLabel({
+  String? subLocality,
+  String? thoroughfare,
+  String? locality,
+  String? administrativeArea,
+  String? country,
+}) {
+  final parts = <String>[];
+  for (final value in [
+    subLocality,
+    thoroughfare,
+    locality,
+    administrativeArea,
+    country,
+  ]) {
+    final clean = value?.trim() ?? '';
+    if (clean.isEmpty || parts.contains(clean)) continue;
+    parts.add(clean);
+  }
+  return parts.join(', ');
+}
+
+final Map<String, AddressInfo> _addressCache = {};
+
+/// Real reverse geocoding. `verified` is false when the platform geocoder is
+/// unavailable or returns no usable address.
+Future<AddressInfo> lookupAddress(LatLng loc) async {
+  final key =
+      '${loc.latitude.toStringAsFixed(5)},${loc.longitude.toStringAsFixed(5)}';
+  final cached = _addressCache[key];
+  if (cached != null) return cached;
+
+  try {
+    final placemarks =
+        await geo.placemarkFromCoordinates(loc.latitude, loc.longitude);
+    if (placemarks.isNotEmpty) {
+      final p = placemarks.first;
+      final label = formatAddressLabel(
+        subLocality: p.subLocality,
+        thoroughfare: p.thoroughfare,
+        locality: p.locality,
+        administrativeArea: p.administrativeArea,
+        country: p.country,
+      );
+      if (label.isNotEmpty) {
+        final info = AddressInfo(label: label, verified: true);
+        _addressCache[key] = info;
+        return info;
+      }
+    }
+  } catch (e) {
+    debugPrint('Nabd: reverse geocoding unavailable: $e');
+  }
+
+  const unavailable = AddressInfo();
+  _addressCache[key] = unavailable;
+  return unavailable;
+}
+
+/// UI text helper. Never invents an address.
+Future<String> describeAddress(LatLng loc) async =>
+    (await lookupAddress(loc)).displayFor(loc);
+
+/// Backwards-compatible wrapper. No hardcoded fallback is used as an address.
+Future<String> reverseGeocodeAddress(LatLng loc) => describeAddress(loc);
+
 String getAreaName(LatLng loc) {
   if (LiveLocationService.customSelectedLabel != null &&
       LiveLocationService.customSelectedPosition != null &&
@@ -440,8 +528,12 @@ enum EmergencyStatus { idle, requesting, active, resolved }
 
 class EmergencySession {
   final String id;
-  final LatLng location;
+  LatLng location; // updated by the emergency-owned GPS stream
   final DateTime startTime;
+  final LocationSource source;
+  final double? accuracyMeters;
+  final String? addressLabel;
+  final List<String> timeline;
   EmergencyStatus status;
   _RespWithDist? assignedResponder;
 
@@ -449,17 +541,39 @@ class EmergencySession {
     required this.id,
     required this.location,
     required this.startTime,
+    this.source = LocationSource.lastKnown,
+    this.accuracyMeters,
+    this.addressLabel,
+    List<String>? timeline,
     this.status = EmergencyStatus.requesting,
     this.assignedResponder,
-  });
+  }) : timeline = timeline ?? <String>[];
 
-  // ── Persistence helpers (Phase 4) ──
+  String get sourceLabel {
+    switch (source) {
+      case LocationSource.liveGps:         return 'LIVE GPS';
+      case LocationSource.lastKnown:       return 'LAST KNOWN';
+      case LocationSource.cached:          return 'CACHED';
+      case LocationSource.simulated:       return 'SIMULATED';
+      case LocationSource.manualSelection: return 'MANUAL SELECTION';
+      case LocationSource.fallback:        return 'FALLBACK (not real)';
+    }
+  }
+
+  void addEvent(String event) =>
+      timeline.add('${DateTime.now().toIso8601String()} · $event');
+
+  // ── Persistence helpers ──
   Map<String, dynamic> toJson() => {
     'id': id,
     'lat': location.latitude,
     'lng': location.longitude,
     'startTime': startTime.toIso8601String(),
     'status': status.name,
+    'source': source.name,
+    'accuracy': accuracyMeters,
+    'address': addressLabel,
+    'timeline': timeline,
     'responderName': assignedResponder?.responder.name,
     'responderDist': assignedResponder?.distLabel,
   };
@@ -469,6 +583,18 @@ class EmergencySession {
       id: j['id'] as String,
       location: LatLng((j['lat'] as num).toDouble(), (j['lng'] as num).toDouble()),
       startTime: DateTime.parse(j['startTime'] as String),
+      source: LocationSource.values.firstWhere(
+        (e) => e.name == j['source'],
+        orElse: () => LocationSource.lastKnown,
+      ),
+      accuracyMeters: j['accuracy'] == null
+          ? null
+          : (j['accuracy'] as num).toDouble(),
+      addressLabel: j['address'] as String?,
+      timeline: (j['timeline'] as List<dynamic>?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          <String>[],
       status: EmergencyStatus.values.firstWhere(
         (e) => e.name == j['status'],
         orElse: () => EmergencyStatus.resolved,
@@ -481,14 +607,23 @@ class EmergencySession {
 // ── Global active session (simple state – swap with Provider later) ──
 EmergencySession? _activeSession;
 
+/// Client id of the GPS stream owned by the active emergency, kept alive even
+/// when the SOS screen is popped. Cleared on cancel/resolution.
+int? _emergencyTrackToken;
+
 // ── History list (saved locally, swap with DB later) ──
 final List<EmergencySession> _emergencyHistory = [];
 
-// ── Add session to history helper ──
+// ── Add/update a session in local history ──
+// Does NOT invent a resolved status: the caller owns the real status.
 void _saveToHistory(EmergencySession session) {
-  session.status = EmergencyStatus.resolved;
-  _emergencyHistory.insert(0, session); // newest first
-  _persistHistory(); // Phase 4: save to SharedPreferences
+  final index = _emergencyHistory.indexWhere((s) => s.id == session.id);
+  if (index >= 0) {
+    _emergencyHistory[index] = session;
+  } else {
+    _emergencyHistory.insert(0, session); // newest first
+  }
+  _persistHistory(); // SharedPreferences; local only, no backend claim
 }
 
 // ── Phase 4: Persist history to SharedPreferences ──
@@ -497,6 +632,7 @@ Future<void> _persistHistory() async {
     final prefs = await SharedPreferences.getInstance();
     final jsonList = _emergencyHistory.map((s) => jsonEncode(s.toJson())).toList();
     await prefs.setStringList('emergency_history', jsonList);
+    debugPrint('Nabd history: persisted ${_emergencyHistory.length} session(s)');
   } catch (_) {}
 }
 
@@ -511,6 +647,7 @@ Future<void> _loadPersistedHistory() async {
         _emergencyHistory.add(session);
       } catch (_) {}
     }
+    debugPrint('Nabd history: loaded ${_emergencyHistory.length} session(s) from SharedPreferences');
   } catch (_) {}
 }
 
@@ -642,19 +779,99 @@ class NotificationService {
 }
 
 // ============================================================
+// LOCATION SOURCE TRACKING (Person 2 - GPS Source Labeling)
+// ============================================================
+
+enum LocationSource {
+  liveGps,
+  lastKnown,
+  cached,
+  simulated,       // emulator/mock provider
+  manualSelection, // user picked from preset list
+  fallback,        // hardcoded default — NOT real location
+}
+
+class LocationResult {
+  final LatLng position;
+  final LocationSource source;
+  final double? accuracyMeters;
+  final DateTime timestamp;
+
+  const LocationResult({
+    required this.position,
+    required this.source,
+    this.accuracyMeters,
+    required this.timestamp,
+  });
+
+  String get sourceLabel {
+    switch (source) {
+      case LocationSource.liveGps:          return 'LIVE GPS';
+      case LocationSource.lastKnown:        return 'LAST KNOWN';
+      case LocationSource.cached:           return 'CACHED';
+      case LocationSource.simulated:        return 'SIMULATED';
+      case LocationSource.manualSelection:  return 'MANUAL SELECTION';
+      case LocationSource.fallback:         return 'FALLBACK (not real)';
+    }
+  }
+
+  bool get isReal => source == LocationSource.liveGps ||
+                     source == LocationSource.lastKnown;
+}
+
+// ============================================================
 // LIVE LOCATION SERVICE (Person 2 - Mobile Emergency Developer)
 // ============================================================
 
 class LiveLocationService {
   static StreamSubscription<Position>? _sub;
+  static final Map<int, void Function(LatLng)> _clients = {};
+  static int _nextClientId = 0;
+
   static LatLng? lastKnownPosition;
   static LatLng? customSelectedPosition;
   static String? customSelectedLabel;
+  static LocationSource lastSource = LocationSource.fallback;
+  static double? lastAccuracyMeters;
+  static DateTime? lastUpdateTime;
+  static AddressInfo? lastAddressInfo;
+
+  static String get lastSourceLabel {
+    switch (lastSource) {
+      case LocationSource.liveGps:         return 'LIVE GPS';
+      case LocationSource.lastKnown:       return 'LAST KNOWN';
+      case LocationSource.cached:          return 'CACHED';
+      case LocationSource.simulated:       return 'SIMULATED';
+      case LocationSource.manualSelection: return 'MANUAL SELECTION';
+      case LocationSource.fallback:        return 'FALLBACK (not real)';
+    }
+  }
+
+  /// Compact metadata line used by map/home location chips.
+  static String get metadataLine {
+    final parts = <String>[lastSourceLabel];
+    if (lastAccuracyMeters != null) {
+      parts.add('±${lastAccuracyMeters!.round()}m');
+    }
+    final t = lastUpdateTime;
+    if (t != null) {
+      parts.add('${t.hour.toString().padLeft(2, '0')}:'
+          '${t.minute.toString().padLeft(2, '0')}');
+    }
+    return parts.join(' · ');
+  }
 
   static void setCustomLocation(LatLng loc, {String? label}) {
     customSelectedPosition = loc;
     customSelectedLabel = label;
     lastKnownPosition = loc;
+    lastSource = LocationSource.manualSelection;
+    lastAccuracyMeters = null;
+    lastUpdateTime = DateTime.now();
+    lastAddressInfo = null;
+    for (final client in _clients.values.toList()) {
+      client(loc);
+    }
   }
 
   static void clearCustomLocation() {
@@ -662,208 +879,370 @@ class LiveLocationService {
     customSelectedLabel = null;
   }
 
-  // Start streaming live location with heading & distance filtering
-  static void startTracking({required void Function(LatLng) onUpdate}) {
-    _sub?.cancel();
+  /// Starts (or joins) the single shared GPS stream.
+  /// Returns a client id that MUST be passed to [stopTracking] when the
+  /// owning screen/session is disposed. This prevents duplicate listeners.
+  static int startTracking({required void Function(LatLng) onUpdate}) {
+    final id = ++_nextClientId;
+    _clients[id] = onUpdate;
+    debugPrint('Nabd GPS: start client=$id total=${_clients.length}');
     if (customSelectedPosition != null) {
       onUpdate(customSelectedPosition!);
-      return;
+      return id;
     }
-    _sub = Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.high,
-        distanceFilter: 5, // meters
-      ),
-    ).listen((pos) {
-      lastKnownPosition = LatLng(pos.latitude, pos.longitude);
-      onUpdate(lastKnownPosition!);
-    });
+    if (_sub == null) {
+      _sub = Geolocator.getPositionStream(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          distanceFilter: 5, // meters — battery-aware
+        ),
+      ).listen(_emit, onError: (e) {
+        debugPrint('Nabd GPS stream error: $e');
+      });
+    }
+    return id;
   }
 
-  static void stopTracking() {
-    _sub?.cancel();
-    _sub = null;
+  static void _emit(Position pos) {
+    lastKnownPosition = LatLng(pos.latitude, pos.longitude);
+    lastSource = pos.isMocked ? LocationSource.simulated : LocationSource.liveGps;
+    lastAccuracyMeters = pos.accuracy;
+    lastUpdateTime = DateTime.now();
+    lastAddressInfo = null; // address must be re-resolved for a new position
+    final posCopy = lastKnownPosition!;
+    for (final client in _clients.values.toList()) {
+      client(posCopy);
+    }
   }
 
-  // High-reliability GPS locator: Checks cache first (0ms), then attempts GPS with fallback
-  static Future<LatLng?> getCurrentPosition() async {
+  /// Stops one client, or all clients when called without an id (full reset).
+  static void stopTracking([int? clientId]) {
+    if (clientId == null) {
+      _clients.clear();
+    } else {
+      _clients.remove(clientId);
+    }
+    debugPrint('Nabd GPS: stop client=$clientId remaining=${_clients.length}');
+    if (_clients.isEmpty) {
+      _sub?.cancel();
+      _sub = null;
+    }
+  }
+
+  static Future<void> openSettings() => Geolocator.openAppSettings();
+
+  static String permissionMessage(LocationPermission p) {
+    switch (p) {
+      case LocationPermission.denied:
+        return 'Location permission denied';
+      case LocationPermission.deniedForever:
+        return 'Location permission permanently denied — open app settings';
+      case LocationPermission.unableToDetermine:
+        return 'Unable to determine location permission';
+      case LocationPermission.whileInUse:
+      case LocationPermission.always:
+        return 'Location permission granted';
+    }
+  }
+
+  /// Returns the current device position with source labeling.
+  /// NEVER silently returns a hardcoded fallback as "real" location.
+  static Future<LocationResult?> getCurrentPositionWithSource() async {
     if (customSelectedPosition != null) {
-      return customSelectedPosition;
+      return LocationResult(
+        position: customSelectedPosition!,
+        source: LocationSource.manualSelection,
+        timestamp: DateTime.now(),
+      );
     }
     try {
-      // 1. Instant cache check: Grab phone's last known location immediately
-      final cached = await Geolocator.getLastKnownPosition();
-      if (cached != null) {
-        lastKnownPosition = LatLng(cached.latitude, cached.longitude);
-      }
-
-      // 2. Check location service
+      // 1. Check location service
       final serviceEnabled = await Geolocator.isLocationServiceEnabled();
       if (!serviceEnabled) {
-        return lastKnownPosition ?? const LatLng(30.0444, 31.2357);
+        // Try cached before giving up
+        final cached = await Geolocator.getLastKnownPosition();
+        if (cached != null) {
+          lastKnownPosition = LatLng(cached.latitude, cached.longitude);
+          lastSource = LocationSource.cached;
+          lastUpdateTime = DateTime.now();
+          return LocationResult(
+            position: lastKnownPosition!,
+            source: LocationSource.cached,
+            accuracyMeters: cached.accuracy,
+            timestamp: DateTime.now(),
+          );
+        }
+        // No cached position available, return null — do NOT fake it
+        return null;
       }
 
-      // 3. Check and request location permission
+      // 2. Check and request location permission
       LocationPermission perm = await Geolocator.checkPermission();
       if (perm == LocationPermission.denied) {
         perm = await Geolocator.requestPermission();
       }
       if (perm == LocationPermission.denied ||
-          perm == LocationPermission.deniedForever) {
-        return lastKnownPosition ?? const LatLng(30.0444, 31.2357);
+          perm == LocationPermission.deniedForever ||
+          perm == LocationPermission.unableToDetermine) {
+        debugPrint('Nabd: ${permissionMessage(perm)}');
+        // Only a previously observed position may be returned, clearly cached.
+        if (lastKnownPosition != null) {
+          lastSource = LocationSource.cached;
+          return LocationResult(
+            position: lastKnownPosition!,
+            source: LocationSource.cached,
+            accuracyMeters: lastAccuracyMeters,
+            timestamp: DateTime.now(),
+          );
+        }
+        return null;
       }
 
-      // 4. Try high-precision GPS with 5s timeout
+      // 3. Try last known instantly (non-blocking)
+      final cached = await Geolocator.getLastKnownPosition();
+      if (cached != null) {
+        lastKnownPosition = LatLng(cached.latitude, cached.longitude);
+      }
+
+      // 4. Try high-precision GPS with 8s timeout
       try {
         final pos = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.high,
-          timeLimit: const Duration(seconds: 5),
+          locationSettings: AndroidSettings(
+            accuracy: LocationAccuracy.high,
+            timeLimit: const Duration(seconds: 8),
+          ),
         );
         lastKnownPosition = LatLng(pos.latitude, pos.longitude);
-        return lastKnownPosition;
+        lastSource = pos.isMocked ? LocationSource.simulated : LocationSource.liveGps;
+        lastAccuracyMeters = pos.accuracy;
+        lastUpdateTime = DateTime.now();
+        return LocationResult(
+          position: lastKnownPosition!,
+          source: lastSource,
+          accuracyMeters: pos.accuracy,
+          timestamp: DateTime.now(),
+        );
       } catch (_) {
-        // High-precision timed out (e.g. indoors) -> graceful fallback to network/cell/Wi-Fi
+        // High-precision timed out — try medium accuracy
         try {
           final pos = await Geolocator.getCurrentPosition(
-            desiredAccuracy: LocationAccuracy.medium,
-            timeLimit: const Duration(seconds: 4),
+            locationSettings: AndroidSettings(
+              accuracy: LocationAccuracy.medium,
+              timeLimit: const Duration(seconds: 5),
+            ),
           );
           lastKnownPosition = LatLng(pos.latitude, pos.longitude);
-          return lastKnownPosition;
+          lastSource = pos.isMocked ? LocationSource.simulated : LocationSource.liveGps;
+          lastAccuracyMeters = pos.accuracy;
+          lastUpdateTime = DateTime.now();
+          return LocationResult(
+            position: lastKnownPosition!,
+            source: lastSource,
+            accuracyMeters: pos.accuracy,
+            timestamp: DateTime.now(),
+          );
         } catch (_) {
-          return lastKnownPosition ?? const LatLng(30.0444, 31.2357);
+          // Fall back to cached/last known — labeled correctly
+          if (lastKnownPosition != null) {
+            return LocationResult(
+              position: lastKnownPosition!,
+              source: LocationSource.lastKnown,
+              timestamp: DateTime.now(),
+            );
+          }
+          return null;
         }
       }
     } catch (_) {
-      return lastKnownPosition ?? const LatLng(30.0444, 31.2357);
+      if (lastKnownPosition != null) {
+        return LocationResult(
+          position: lastKnownPosition!,
+          source: LocationSource.lastKnown,
+          timestamp: DateTime.now(),
+        );
+      }
+      return null;
     }
   }
 
-  // Auto-detect if device GPS is switched off and show instant prompt
+  /// Legacy wrapper — returns position only, for backward compatibility.
+  /// Now returns null instead of hardcoded fallback when GPS unavailable.
+  static Future<LatLng?> getCurrentPosition() async {
+    final result = await getCurrentPositionWithSource();
+    return result?.position;
+  }
+
+  /// Prompts only when the device GPS is off or permission is not granted.
+  /// Offers App Settings for permanently-denied/restricted permission states.
   static Future<void> promptEnableGps(BuildContext context) async {
     try {
       final enabled = await Geolocator.isLocationServiceEnabled();
-      if (!enabled && context.mounted) {
-        showModalBottomSheet(
-          context: context,
-          backgroundColor: Colors.transparent,
-          builder: (ctx) => Container(
-            padding: const EdgeInsets.all(24),
-            decoration: const BoxDecoration(
-              color: Color(0xFF1C1D21),
-              borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  width: 44,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: Colors.white24,
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                ),
-                const SizedBox(height: 20),
-                Container(
-                  width: 60,
-                  height: 60,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFE92335).withOpacity(0.15),
-                    shape: BoxShape.circle,
-                  ),
-                  child: const Icon(Icons.location_off_rounded, color: Color(0xFFE92335), size: 32),
-                ),
-                const SizedBox(height: 16),
-                const Text(
-                  'تفعيل خدمة الموقع (GPS)',
-                  style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 8),
-                const Text(
-                  'خدمة الـ GPS غير مفعلة على هاتفك.\nلتحديد مكانك وتوجيه أقرب إسعاف وطبيب إليك بدقة، يرجى تفعيل الموقع.',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: Colors.white70, fontSize: 13, height: 1.5),
-                ),
-                const SizedBox(height: 22),
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextButton(
-                        style: TextButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(vertical: 14),
-                        ),
-                        onPressed: () => Navigator.pop(ctx),
-                        child: const Text('لاحقاً', style: TextStyle(color: Colors.white54, fontSize: 15)),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      flex: 2,
-                      child: ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFFE92335),
-                          foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(vertical: 14),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                        ),
-                        icon: const Icon(Icons.my_location_rounded, size: 20),
-                        label: const Text('تفعيل الآن', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                        onPressed: () async {
-                          Navigator.pop(ctx);
-                          await Geolocator.openLocationSettings();
-                        },
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-              ],
-            ),
+      final perm = await Geolocator.checkPermission();
+      final needsGps = !enabled;
+      final needsPermission = perm == LocationPermission.denied ||
+          perm == LocationPermission.deniedForever ||
+          perm == LocationPermission.unableToDetermine;
+      if ((!needsGps && !needsPermission) || !context.mounted) return;
+
+      showModalBottomSheet(
+        context: context,
+        backgroundColor: Colors.transparent,
+        builder: (ctx) => Container(
+          padding: const EdgeInsets.all(24),
+          decoration: const BoxDecoration(
+            color: Color(0xFF1C1D21),
+            borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
           ),
-        );
-      }
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 44,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.white24,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              ),
+              const SizedBox(height: 20),
+              Container(
+                width: 60,
+                height: 60,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE92335).withOpacity(0.15),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(Icons.location_off_rounded, color: Color(0xFFE92335), size: 32),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                needsGps ? 'تفعيل خدمة الموقع (GPS)' : 'صلاحية الموقع مطلوبة',
+                style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                needsGps
+                    ? 'خدمة الـ GPS غير مفعلة على هاتفك.\nلتحديد مكانك وتوجيه أقرب إسعاف وطبيب إليك بدقة، يرجى تفعيل الموقع.'
+                    : 'يجب السماح للتطبيق بالوصول إلى موقع الجهاز لتحديد مكانك بدقة.\n${permissionMessage(perm)}',
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.5),
+              ),
+              const SizedBox(height: 22),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextButton(
+                      style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                      ),
+                      onPressed: () => Navigator.pop(ctx),
+                      child: const Text('لاحقاً', style: TextStyle(color: Colors.white54, fontSize: 15)),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    flex: 2,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFFE92335),
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                      ),
+                      icon: const Icon(Icons.my_location_rounded, size: 20),
+                      label: Text(
+                        needsGps ? 'تفعيل الآن' : 'منح الصلاحية',
+                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                      ),
+                      onPressed: () async {
+                        Navigator.pop(ctx);
+                        if (needsGps) {
+                          await Geolocator.openLocationSettings();
+                        } else if (perm == LocationPermission.denied) {
+                          await Geolocator.requestPermission();
+                        } else {
+                          await openSettings();
+                        }
+                      },
+                    ),
+                  ),
+                ],
+              ),
+              if (needsPermission && perm != LocationPermission.denied)
+                TextButton(
+                  onPressed: () async {
+                    Navigator.pop(ctx);
+                    await openSettings();
+                  },
+                  child: const Text('Open App Settings',
+                      style: TextStyle(color: Colors.white70, fontSize: 12)),
+                ),
+              const SizedBox(height: 10),
+            ],
+          ),
+        ),
+      );
     } catch (_) {}
   }
 }
 
-// ── Send SMS with location link ────────────────────────────────
-Future<void> _sendEmergencySMS(LatLng location) async {
-  final mapsLink =
-      'https://maps.google.com/?q=${location.latitude},${location.longitude}';
-  final area = getAreaName(location);
-  final msg = Uri.encodeComponent(
-    '🚨 EMERGENCY SOS! I need help!\nArea: $area\nMy location: $mapsLink\nPlease send help immediately.',
-  );
-  final smsUri = Uri.parse('sms:123?body=$msg');
+// ── SOS launch helpers ─────────────────────────────────────────
+// These only OPEN a dialer/SMS/WhatsApp composer. They never place a call or
+// send a message by themselves and never claim that a backend was contacted.
+// Return value reports the real launch result so the UI can be honest.
+
+Future<bool> _openDialer(String number) async {
+  final uri = Uri(scheme: 'tel', path: number);
   try {
-    if (await canLaunchUrl(smsUri)) {
-      await launchUrl(smsUri);
-    }
-    // If can't launch, fail silently — caller handles error display
+    if (!await canLaunchUrl(uri)) return false;
+    return await launchUrl(uri);
   } catch (_) {
-    rethrow; // let caller show error message
+    return false;
   }
 }
 
-// ── Send WhatsApp SOS with location link ───────────────────────
-Future<void> _sendEmergencyWhatsApp(LatLng location) async {
+/// Opens the SMS composer with the current location link. Returns true only
+/// when an SMS app was actually launched.
+Future<bool> _sendEmergencySMS(LatLng location) async {
   final mapsLink =
       'https://maps.google.com/?q=${location.latitude},${location.longitude}';
-  final area = getAreaName(location);
+  final address = LiveLocationService.lastAddressInfo?.hasAddress == true
+      ? LiveLocationService.lastAddressInfo!.label
+      : 'Address unavailable';
+  final msg = Uri.encodeComponent(
+    '🚨 EMERGENCY SOS! I need help!\nArea (approx.): ${getAreaName(location)}\n'
+    'Address: $address\nMy location: $mapsLink\nPlease send help immediately.',
+  );
+  final smsUri = Uri.parse('sms:123?body=$msg');
+  try {
+    if (!await canLaunchUrl(smsUri)) return false;
+    return await launchUrl(smsUri);
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Opens WhatsApp with a pre-filled message. Returns true only when WhatsApp
+/// (or a browser fallback) was actually launched.
+Future<bool> _sendEmergencyWhatsApp(LatLng location) async {
+  final mapsLink =
+      'https://maps.google.com/?q=${location.latitude},${location.longitude}';
+  final address = LiveLocationService.lastAddressInfo?.hasAddress == true
+      ? LiveLocationService.lastAddressInfo!.label
+      : 'Address unavailable';
   final msg = Uri.encodeComponent(
     '🚨 EMERGENCY SOS! I need immediate help!\n'
-    '📍 Area: $area\n'
-    '🗺️ Live Google Maps Location: $mapsLink\n'
+    '📍 Area (approx.): ${getAreaName(location)}\n'
+    '📍 Address: $address\n'
+    '🗺️ My location: $mapsLink\n'
     'Please contact emergency responders (123) or come immediately!',
   );
   final waUri = Uri.parse('https://wa.me/?text=$msg');
   try {
-    if (await canLaunchUrl(waUri)) {
-      await launchUrl(waUri, mode: LaunchMode.externalApplication);
-    }
+    if (!await canLaunchUrl(waUri)) return false;
+    return await launchUrl(waUri, mode: LaunchMode.externalApplication);
   } catch (_) {
-    rethrow;
+    return false;
   }
 }
 
@@ -949,6 +1328,7 @@ class GetStartedScreen extends StatelessWidget {
               behavior: HitTestBehavior.opaque,
 
               onTap: () {
+                debugPrint('Nabd: GetStarted tapped -> HomeScreen');
                 Navigator.pushReplacement(
                   context,
                   MaterialPageRoute(
@@ -1064,10 +1444,14 @@ class _HomeContentState extends State<HomeContent> {
 
   ll.LatLng? _userPosition = LiveLocationService.lastKnownPosition != null
       ? toLl(LiveLocationService.lastKnownPosition!)
-      : const ll.LatLng(30.0444, 31.2357);
+      : null; // Start null — do NOT show hardcoded location
   String _locationDisplay = 'Detecting live GPS...';
+  String _locationSourceLabel = '';
+  String _addressLabel = 'Resolving address…';
+  bool _hasRealLocation = false; // Track whether we have real GPS
   bool _isLocating = false;
   final fmap.MapController _previewMapController = fmap.MapController();
+  int? _trackingId;
   // Phase 6: Offline detection
   bool _isOffline = false;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
@@ -1080,18 +1464,9 @@ class _HomeContentState extends State<HomeContent> {
     });
     _tryAutoDetectLocation();
     // Start live GPS tracking stream immediately upon opening
-    LiveLocationService.startTracking(onUpdate: (loc) {
-      if (mounted) {
-        final newLl = toLl(loc);
-        final area = getAreaName(loc);
-        setState(() {
-          _userPosition = newLl;
-          _locationDisplay = '$area (${loc.latitude.toStringAsFixed(3)}, ${loc.longitude.toStringAsFixed(3)})';
-        });
-        try {
-          _previewMapController.move(newLl, 14.5);
-        } catch (_) {}
-      }
+    _trackingId = LiveLocationService.startTracking(onUpdate: (loc) {
+      if (!mounted) return;
+      _applyLocation(toLl(loc));
     });
     // Phase 6: listen for connectivity changes
     _connectivitySub = Connectivity().onConnectivityChanged.listen((results) {
@@ -1120,11 +1495,47 @@ class _HomeContentState extends State<HomeContent> {
   @override
   void dispose() {
     _connectivitySub?.cancel();
+    if (_trackingId != null) LiveLocationService.stopTracking(_trackingId);
     super.dispose();
   }
 
   Future<void> _tryAutoDetectLocation() async {
     await _fetchLocation();
+  }
+
+  /// Single place that applies a new coordinate to Home UI.
+  void _applyLocation(ll.LatLng position) {
+    if (!mounted) return;
+    final source = LiveLocationService.lastSource;
+    final accuracy = LiveLocationService.lastAccuracyMeters;
+    debugPrint('Nabd Home: ${position.latitude.toStringAsFixed(5)},'
+        '${position.longitude.toStringAsFixed(5)} '
+        'source=${LiveLocationService.lastSourceLabel} '
+        'accuracy=${accuracy?.round()}m');
+    setState(() {
+      _userPosition = position;
+      _hasRealLocation = source != LocationSource.fallback &&
+          source != LocationSource.manualSelection;
+      _locationSourceLabel = LiveLocationService.lastSourceLabel;
+      _locationDisplay =
+          '${position.latitude.toStringAsFixed(4)}, '
+          '${position.longitude.toStringAsFixed(4)}'
+          '${accuracy != null ? ' ±${accuracy.round()}m' : ''} '
+          '[$_locationSourceLabel]';
+    });
+    try {
+      _previewMapController.move(position, 14.5);
+    } catch (_) {}
+    _resolveAddress(position);
+  }
+
+  Future<void> _resolveAddress(ll.LatLng position) async {
+    final gMapPos = LatLng(position.latitude, position.longitude);
+    final info = await lookupAddress(gMapPos);
+    debugPrint('Nabd address: ${info.verified ? info.label : 'unavailable'}');
+    LiveLocationService.lastAddressInfo = info;
+    if (!mounted) return;
+    setState(() => _addressLabel = info.displayFor(gMapPos));
   }
 
   Future<void> _fetchLocation() async {
@@ -1134,26 +1545,28 @@ class _HomeContentState extends State<HomeContent> {
       _locationDisplay = 'Detecting GPS location...';
     });
     try {
-      final pos = await LiveLocationService.getCurrentPosition();
-      if (pos != null && mounted) {
-        final userLl = ll.LatLng(pos.latitude, pos.longitude);
-        final area = getAreaName(pos);
-        setState(() {
-          _userPosition = userLl;
-          _locationDisplay = '$area (${pos.latitude.toStringAsFixed(3)}, ${pos.longitude.toStringAsFixed(3)})';
-        });
-        try {
-          _previewMapController.move(userLl, 14.5);
-        } catch (_) {}
+      final result = await LiveLocationService.getCurrentPositionWithSource();
+      if (result != null && mounted) {
+        LiveLocationService.lastSource = result.source;
+        LiveLocationService.lastAccuracyMeters = result.accuracyMeters;
+        LiveLocationService.lastUpdateTime = result.timestamp;
+        _applyLocation(ll.LatLng(result.position.latitude, result.position.longitude));
       } else if (mounted) {
+        debugPrint('Nabd Home: no location result (GPS off / permission / no fix)');
         setState(() {
-          _locationDisplay = 'Tap to activate live GPS';
+          _locationDisplay = 'GPS unavailable — tap to retry';
+          _addressLabel = 'Address unavailable';
+          _hasRealLocation = false;
+          _locationSourceLabel = '';
         });
       }
     } catch (e) {
       if (mounted) {
+        debugPrint('Nabd Home: location error $e');
         setState(() {
           _locationDisplay = 'Location unavailable';
+          _addressLabel = 'Address unavailable';
+          _hasRealLocation = false;
         });
       }
     } finally {
@@ -1388,11 +1801,35 @@ class _HomeContentState extends State<HomeContent> {
                             decoration: BoxDecoration(color: const Color(0xFFFFE9EC), borderRadius: BorderRadius.circular(14)),
                             child: const Icon(Icons.location_on_rounded, color: brandRed, size: 26)),
                         const SizedBox(width: 11),
-                        const Expanded(
+                        Expanded(
                           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                            Text('Your Location', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800, color: darkText)),
-                            SizedBox(height: 4),
-                            Row(children: [Icon(Icons.circle, size: 7, color: Color(0xFF20B66B)), SizedBox(width: 6), Text('Cairo, Egypt', style: TextStyle(fontSize: 11, color: mutedText))]),
+                            const Text('Your Location', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800, color: darkText)),
+                            const SizedBox(height: 4),
+                            Row(children: [
+                              Icon(Icons.circle, size: 7,
+                                color: _hasRealLocation ? const Color(0xFF20B66B) : const Color(0xFFFFA726)),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  _userPosition != null
+                                      ? _addressLabel
+                                      : (_isLocating ? 'Detecting GPS...' : 'Tap to detect location'),
+                                  style: const TextStyle(fontSize: 11, color: mutedText),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ]),
+                            if (_userPosition != null)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 3, left: 13),
+                                child: Text(
+                                  _locationDisplay,
+                                  style: const TextStyle(fontSize: 9.5, color: Color(0xFF9BA1A6)),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
                           ]),
                         ),
                         Container(padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
@@ -1422,23 +1859,23 @@ class _HomeContentState extends State<HomeContent> {
                   ),
                   child: Stack(
                     children: [
-                      Positioned.fill(
-                        child: IgnorePointer(
-                          child: fmap.FlutterMap(
-                            mapController: _previewMapController,
-                            options: fmap.MapOptions(
-                              initialCenter: _userPosition ?? const ll.LatLng(30.0444, 31.2357),
-                              initialZoom: 14.5,
-                              interactionOptions: const fmap.InteractionOptions(
-                                flags: fmap.InteractiveFlag.none,
+                      if (_userPosition != null)
+                        Positioned.fill(
+                          child: IgnorePointer(
+                            child: fmap.FlutterMap(
+                              mapController: _previewMapController,
+                              options: fmap.MapOptions(
+                                initialCenter: _userPosition!,
+                                initialZoom: 14.5,
+                                interactionOptions: const fmap.InteractionOptions(
+                                  flags: fmap.InteractiveFlag.none,
+                                ),
                               ),
-                            ),
-                            children: [
-                              fmap.TileLayer(
-                                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                                userAgentPackageName: 'com.example.emergency_help',
-                              ),
-                              if (_userPosition != null)
+                              children: [
+                                fmap.TileLayer(
+                                  urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                                  userAgentPackageName: 'com.example.emergency_help',
+                                ),
                                 fmap.MarkerLayer(
                                   markers: [
                                     fmap.Marker(
@@ -1471,10 +1908,18 @@ class _HomeContentState extends State<HomeContent> {
                                     ),
                                   ],
                                 ),
-                            ],
+                              ],
+                            ),
+                          ),
+                        )
+                      else
+                        const Positioned.fill(
+                          child: Center(
+                            child: Text('Detecting live location…',
+                                style: TextStyle(
+                                    color: mutedText, fontSize: 12)),
                           ),
                         ),
-                      ),
                       Positioned(
                         left: 12,
                         top: 12,
@@ -1493,18 +1938,21 @@ class _HomeContentState extends State<HomeContent> {
                               const Icon(Icons.location_on_rounded,
                                   color: brandRed, size: 15),
                               const SizedBox(width: 6),
-                              Text(
-                                _isLocating
-                                    ? 'Detecting…'
-                                    : (_userPosition != null
-                                        ? getAreaName(LatLng(
-                                            _userPosition!.latitude,
-                                            _userPosition!.longitude))
-                                        : 'Cairo, Egypt'),
-                                style: const TextStyle(
-                                  color: darkText,
-                                  fontSize: 10.5,
-                                  fontWeight: FontWeight.w700,
+                              ConstrainedBox(
+                                constraints: const BoxConstraints(maxWidth: 180),
+                                child: Text(
+                                  _isLocating
+                                      ? 'Detecting…'
+                                      : (_userPosition != null
+                                          ? _addressLabel
+                                          : 'Location unavailable'),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: darkText,
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.w700,
+                                  ),
                                 ),
                               ),
                               const SizedBox(width: 5),
@@ -1960,12 +2408,15 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
 
   // State
   EmergencyStatus _status = EmergencyStatus.idle;
+  LocationResult? _locationResult;
   LatLng?         _userLocation;
+  String?         _addressLabel;
   _RespWithDist?  _nearestResponder;
   bool            _locationLoading = false;
+  bool            _triggerInProgress = false;
   String?         _statusMessage;
   Timer?          _pingTimer;
-  int             _pingCount = 0;
+  int?            _screenTrackToken;
 
   // Animations
   late AnimationController _pulseCtrl;
@@ -1990,7 +2441,27 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
       CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut),
     );
 
-    _fetchLocation();
+    final existing = _activeSession;
+    if (existing != null && existing.status == EmergencyStatus.active) {
+      // Re-entering during an active emergency: restore honest state instead of
+      // allowing a duplicate SOS, and join the existing stream as a new client.
+      _status = EmergencyStatus.active;
+      _statusMessage = 'Emergency active — live GPS on this device. Complete your call to 123.';
+      _locationResult = LocationResult(
+        position: existing.location,
+        source: existing.source,
+        accuracyMeters: existing.accuracyMeters,
+        timestamp: existing.startTime,
+      );
+      _userLocation = existing.location;
+      _addressLabel = existing.addressLabel;
+      _nearestResponder = existing.assignedResponder;
+      _screenTrackToken = LiveLocationService.startTracking(
+        onUpdate: _applyStreamedLocation,
+      );
+    } else {
+      _fetchLocation();
+    }
   }
 
   @override
@@ -1998,33 +2469,80 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
     _pulseCtrl.dispose();
     _statusCtrl.dispose();
     _pingTimer?.cancel();
-    // Phase 2: Only stop tracking if emergency is NOT active
-    // (keep streaming if user navigates back during active emergency)
-    if (_status == EmergencyStatus.idle || _status == EmergencyStatus.resolved) {
-      LiveLocationService.stopTracking();
+    // Stop only this screen's client. The emergency-owned client is stopped on
+    // cancel/resolution. No global stopTracking() that would break other screens.
+    if (_screenTrackToken != null) {
+      LiveLocationService.stopTracking(_screenTrackToken);
+      _screenTrackToken = null;
     }
     super.dispose();
   }
 
-  // ── Get current GPS location ──
+  // ── Get real device location with an explicit source label ──
   Future<void> _fetchLocation() async {
     setState(() => _locationLoading = true);
-    final loc = await LiveLocationService.getCurrentPosition();
-    if (mounted) {
-      setState(() {
-        _userLocation   = loc;
-        _locationLoading = false;
-        if (loc != null) {
-          final sorted = _sortedByDistance(loc);
-          _nearestResponder = sorted.isNotEmpty ? sorted.first : null;
-        }
-      });
+    final result = await LiveLocationService.getCurrentPositionWithSource();
+    if (!mounted) return;
+    setState(() {
+      _locationResult = result;
+      _userLocation = result?.position;
+      _locationLoading = false;
+      _addressLabel = result == null
+          ? null
+          : (LiveLocationService.lastAddressInfo?.hasAddress == true
+              ? LiveLocationService.lastAddressInfo!.label
+              : null);
+      if (result != null) {
+        final sorted = _sortedByDistance(result.position);
+        _nearestResponder = sorted.isNotEmpty ? sorted.first : null;
+      } else {
+        _nearestResponder = null;
+      }
+    });
+    if (result != null && _addressLabel == null) {
+      // Reverse geocoding is separate from GPS and may be unavailable offline.
+      final info = await lookupAddress(result.position);
+      if (mounted && info.hasAddress) {
+        setState(() => _addressLabel = info.label);
+      }
     }
+  }
+
+  /// Applies a streamed GPS update without starting another listener.
+  void _applyStreamedLocation(LatLng loc) {
+    if (!mounted) return;
+    final source = LiveLocationService.customSelectedPosition != null
+        ? LocationSource.manualSelection
+        : LiveLocationService.lastSource;
+    setState(() {
+      _locationResult = LocationResult(
+        position: loc,
+        source: source,
+        accuracyMeters: LiveLocationService.lastAccuracyMeters,
+        timestamp: DateTime.now(),
+      );
+      _userLocation = loc;
+      _addressLabel = null;
+      final sorted = _sortedByDistance(loc);
+      _nearestResponder = sorted.isNotEmpty ? sorted.first : null;
+    });
+    lookupAddress(loc).then((info) {
+      if (mounted && info.hasAddress) setState(() => _addressLabel = info.label);
+    });
+  }
+
+  String get _locationSummaryLabel {
+    final loc = _userLocation;
+    if (loc == null || _locationResult == null) return 'GPS not available';
+    final address = _addressLabel ?? 'Address unavailable';
+    return '${_locationResult!.sourceLabel} · $address '
+        '(${loc.latitude.toStringAsFixed(4)}, ${loc.longitude.toStringAsFixed(4)})';
   }
 
   // ── Main SOS trigger ──
   Future<void> _triggerSOS() async {
-    if (_status != EmergencyStatus.idle) return; // Phase 2: guard against duplicate triggers
+    if (_status != EmergencyStatus.idle || _triggerInProgress) return;
+    _triggerInProgress = true;
     HapticFeedback.heavyImpact();
 
     setState(() {
@@ -2032,93 +2550,136 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
       _statusMessage = 'Getting your location…';
     });
 
-    // 1. Get location
-    LatLng? loc = _userLocation ?? await LiveLocationService.getCurrentPosition();
-    if (loc == null) {
+    // 1. Real location only. Reuse a fresh result, otherwise re-read the device.
+    LocationResult? result = _locationResult;
+    if (result == null ||
+        _userLocation == null ||
+        result.position != _userLocation ||
+        DateTime.now().difference(result.timestamp) > const Duration(seconds: 60)) {
+      result = await LiveLocationService.getCurrentPositionWithSource();
+    }
+    if (!mounted) {
+      _triggerInProgress = false;
+      return;
+    }
+    if (result == null) {
+      _triggerInProgress = false;
       setState(() {
         _status        = EmergencyStatus.idle;
-        _statusMessage = 'Could not get location. Please enable GPS.';
+        _statusMessage = 'No location available. Enable GPS / grant permission and retry.';
       });
       return;
     }
-    _userLocation = loc;
+    final loc = result.position;
 
-    // 2. Find nearest responder
+    // 2. Find nearest responder (demo clustering around the real position).
     final sorted = _sortedByDistance(loc);
-    _nearestResponder = sorted.isNotEmpty ? sorted.first : null;
-
-    setState(() => _statusMessage = 'Calling emergency services…');
-    await Future.delayed(const Duration(milliseconds: 600));
-
-    // 3. Call 123 — Phase 2: safe error handling
-    final callUri = Uri(scheme: 'tel', path: '123');
-    try {
-      if (await canLaunchUrl(callUri)) {
-        await launchUrl(callUri);
-      } else if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Could not launch phone dialer. Please call 123 manually.')),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Call failed: $e')),
-        );
-      }
+    if (mounted) {
+      setState(() {
+        _locationResult = result;
+        _userLocation = loc;
+        _nearestResponder = sorted.isNotEmpty ? sorted.first : null;
+        _statusMessage = 'Opening dialer for 123…';
+      });
     }
 
-    // 4. Send SMS with location — Phase 2: safe error handling
-    setState(() => _statusMessage = 'Sending your location via SMS…');
-    try {
-      await _sendEmergencySMS(loc);
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('SMS could not be sent. Location saved locally.')),
-        );
-      }
-    }
-    await Future.delayed(const Duration(milliseconds: 500));
-
-    // 5. Create session & start live tracking
-    _activeSession = EmergencySession(
+    // 3. Create the local session BEFORE launching anything, so the SOS is
+    //    recorded even if the user has no dialer/SMS app installed.
+    final addressLabel = _addressLabel ??
+        (LiveLocationService.lastAddressInfo?.hasAddress == true
+            ? LiveLocationService.lastAddressInfo!.label
+            : null) ??
+        'Address unavailable';
+    final session = EmergencySession(
       id:        DateTime.now().millisecondsSinceEpoch.toString(),
       location:  loc,
       startTime: DateTime.now(),
-      status:    EmergencyStatus.active,
-      assignedResponder: _nearestResponder,
+      source:    result.source,
+      accuracyMeters: result.accuracyMeters,
+      addressLabel: addressLabel,
+      status:    EmergencyStatus.requesting,
+      assignedResponder: sorted.isNotEmpty ? sorted.first : null,
     );
+    session.addEvent('SOS pressed · ${result.sourceLabel} · $addressLabel');
+    _activeSession = session;
+    _saveToHistory(session);
 
-    LiveLocationService.startTracking(onUpdate: (newLoc) {
-      if (mounted) setState(() => _userLocation = newLoc);
-    });
-
-    // 6. Fire local notification
-    await NotificationService.showEmergencyAlert(
-      title: '🚨 Emergency Request Sent',
-      body:  _nearestResponder != null
-          ? 'Nearest responder: ${_nearestResponder!.responder.name} · ${_nearestResponder!.distLabel}'
-          : 'Emergency services notified. Help is on the way.',
-    );
-
-    // 7. Save session to history (now persisted via SharedPreferences)
-    if (_activeSession != null) {
-      _saveToHistory(_activeSession!);
+    // 4. Open dialer. We do NOT place the call — the user must complete it.
+    final dialerOpened = await _openDialer('123');
+    session.addEvent(dialerOpened
+        ? 'Dialer opened for 123 (call not placed by app)'
+        : 'No dialer available — call 123 manually');
+    if (!mounted) {
+      _triggerInProgress = false;
+      return;
     }
+    setState(() => _statusMessage = 'Opening SMS composer…');
 
-    setState(() {
-      _status        = EmergencyStatus.active;
-      _statusMessage = 'Help is on the way!';
+    // 5. Open SMS composer with the real coordinates.
+    bool smsOpened = false;
+    try {
+      smsOpened = await _sendEmergencySMS(loc);
+    } catch (_) {
+      smsOpened = false;
+    }
+    session.addEvent(smsOpened
+        ? 'SMS composer opened with location link (not auto-sent)'
+        : 'SMS app unavailable — location saved locally');
+    _saveToHistory(session);
+    debugPrint('Nabd SOS: loc=${loc.latitude.toStringAsFixed(5)},'
+        '${loc.longitude.toStringAsFixed(5)} source=${result.sourceLabel} '
+        'accuracy=${result.accuracyMeters?.round()}m '
+        'dialerOpened=$dialerOpened smsOpened=$smsOpened '
+        'address="$addressLabel" (local only)');
+
+    // 6. Activate session and start ONE tracked GPS client owned by this SOS.
+    session.status = EmergencyStatus.active;
+    session.addEvent('Emergency active locally — no backend delivery confirmed');
+    if (_emergencyTrackToken != null) {
+      LiveLocationService.stopTracking(_emergencyTrackToken);
+    }
+    _emergencyTrackToken = LiveLocationService.startTracking(onUpdate: (newLoc) {
+      _applyStreamedLocation(newLoc);
+      if ((_haversineKm(session.location, newLoc) * 1000) > 20) {
+        session.location = newLoc;
+        session.addEvent('Location updated · ${LiveLocationService.lastSourceLabel}');
+        _saveToHistory(session);
+      }
     });
 
-    // 8. Simulate responder ping every 30s
+    // 7. Local-only notification — no claim that a responder was dispatched.
+    await NotificationService.showEmergencyAlert(
+      title: '🚨 SOS recorded on this device',
+      body: dialerOpened
+          ? 'Dialer opened for 123. Complete the call to request help.'
+          : 'No dialer available. Call 123 manually. Location saved locally.',
+    );
+
+    if (!mounted) {
+      _triggerInProgress = false;
+      return;
+    }
+    setState(() {
+      _status = EmergencyStatus.active;
+      _statusMessage = dialerOpened
+          ? 'Dialer opened — complete the call to 123. Location saved locally.'
+          : 'Call 123 manually. Location saved locally.';
+      if (!smsOpened) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('SMS app unavailable. Your location is saved locally.')),
+        );
+      }
+      _triggerInProgress = false;
+    });
+
+    // 8. Local reminder pings only — labelled as reminders, not responder ETA.
     _pingTimer = Timer.periodic(const Duration(seconds: 30), (_) {
-      _pingCount++;
-      if (mounted && _nearestResponder != null) {
+      if (mounted) {
         NotificationService.showEmergencyAlert(
-          title: 'Responder Update',
-          body:  '${_nearestResponder!.responder.name} is heading to you.',
+          title: 'Nabd local reminder',
+          body: dialerOpened
+              ? 'Complete your call to 123 if you have not already.'
+              : 'Call 123 manually to request help.',
         );
       }
     });
@@ -2150,12 +2711,22 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
     );
     if (confirmed == true && mounted) {
       _pingTimer?.cancel();
-      LiveLocationService.stopTracking();
+      _pingTimer = null;
+      if (_emergencyTrackToken != null) {
+        LiveLocationService.stopTracking(_emergencyTrackToken);
+        _emergencyTrackToken = null;
+      }
+      final session = _activeSession;
+      if (session != null) {
+        session.addEvent('Emergency cancelled by user');
+        session.status = EmergencyStatus.resolved;
+        session.assignedResponder = null;
+        _saveToHistory(session);
+      }
       _activeSession = null;
       setState(() {
         _status        = EmergencyStatus.idle;
-        _statusMessage = null;
-        _pingCount     = 0;
+        _statusMessage = 'Emergency cancelled. Local record kept in history.';
       });
     }
   }
@@ -2353,7 +2924,7 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
                                   const SizedBox(width: 6),
                                   Expanded(
                                     child: Text(
-                                      '${getAreaName(_userLocation!)} (${_userLocation!.latitude.toStringAsFixed(4)}, ${_userLocation!.longitude.toStringAsFixed(4)})',
+                                      _locationSummaryLabel,
                                       style: const TextStyle(
                                           color: Colors.white,
                                           fontWeight: FontWeight.w700,
@@ -2369,7 +2940,7 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
                                     Icon(Icons.cell_tower_rounded,
                                         size: 12, color: Color(0xFF4CAF50)),
                                     SizedBox(width: 4),
-                                    Text('Live tracking active',
+                                    Text('Live GPS stream (local device)',
                                         style: TextStyle(
                                             color: Color(0xFF4CAF50),
                                             fontSize: 11)),
@@ -2513,7 +3084,14 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
                       label: 'Call 123',
                       color: const Color(0xFF2E7D32),
                       onTap: () async {
-                        await launchUrl(Uri(scheme: 'tel', path: '123'));
+                        final messenger = ScaffoldMessenger.of(context);
+                        final opened = await _openDialer('123');
+                        if (!mounted) return;
+                        messenger.showSnackBar(
+                          SnackBar(content: Text(opened
+                              ? 'Dialer opened for 123 — complete the call yourself.'
+                              : 'No dialer available — call 123 manually.')),
+                        );
                       },
                     ),
                   ),
@@ -2524,7 +3102,16 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
                       label: 'SMS SOS',
                       color: const Color(0xFF1565C0),
                       onTap: _userLocation != null
-                          ? () => _sendEmergencySMS(_userLocation!)
+                          ? () async {
+                              final messenger = ScaffoldMessenger.of(context);
+                              final opened = await _sendEmergencySMS(_userLocation!);
+                              if (!mounted) return;
+                              messenger.showSnackBar(
+                                SnackBar(content: Text(opened
+                                    ? 'SMS composer opened — message was not auto-sent.'
+                                    : 'No SMS app available. Location saved locally.')),
+                              );
+                            }
                           : null,
                     ),
                   ),
@@ -2535,7 +3122,16 @@ class _EmergencySOSScreenState extends State<EmergencySOSScreen>
                       label: 'WhatsApp',
                       color: const Color(0xFF25D366),
                       onTap: _userLocation != null
-                          ? () => _sendEmergencyWhatsApp(_userLocation!)
+                          ? () async {
+                              final messenger = ScaffoldMessenger.of(context);
+                              final opened = await _sendEmergencyWhatsApp(_userLocation!);
+                              if (!mounted) return;
+                              messenger.showSnackBar(
+                                SnackBar(content: Text(opened
+                                    ? 'WhatsApp composer opened — message was not auto-sent.'
+                                    : 'WhatsApp could not be opened. Try again later.')),
+                              );
+                            }
                           : null,
                     ),
                   ),
@@ -2762,14 +3358,15 @@ class _LiveTrackingMapScreenState extends State<LiveTrackingMapScreen> {
 
   final fmap.MapController _fmapCtrl = fmap.MapController();
   LatLng?              _liveLocation;
-  bool                 _tracking = true;
+  final bool           _tracking = true;
+  int?                 _trackingClientId;
 
   @override
   void initState() {
     super.initState();
     _liveLocation = widget.userLocation;
-    // Start updating live location
-    LiveLocationService.startTracking(onUpdate: (loc) {
+    // Join the shared GPS stream as this screen's own client.
+    _trackingClientId = LiveLocationService.startTracking(onUpdate: (loc) {
       if (mounted) {
         setState(() => _liveLocation = loc);
         try {
@@ -2781,9 +3378,10 @@ class _LiveTrackingMapScreenState extends State<LiveTrackingMapScreen> {
 
   @override
   void dispose() {
-    // Phase 5: Only stop if no active emergency session using this stream
-    if (_activeSession == null || _activeSession!.status != EmergencyStatus.active) {
-      LiveLocationService.stopTracking();
+    // Stop only this screen's client — never the shared stream used by others.
+    if (_trackingClientId != null) {
+      LiveLocationService.stopTracking(_trackingClientId);
+      _trackingClientId = null;
     }
     super.dispose();
   }
@@ -3389,15 +3987,21 @@ class _NearbyHelpScreenState extends State<NearbyHelpScreen> {
     }
   }
 
-  // If GPS fails → use Cairo centre as default
+  // If GPS fails → show message, don't fake location
   void _fallback() {
-    const cairo = LatLng(30.0444, 31.2357);
     if (mounted) {
       setState(() {
-        _userLocation = cairo;
-        _sorted = _sortedByDistance(cairo);
+        _userLocation = null;
+        _sorted = [];
         _loading = false;
       });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('GPS unavailable — please enable location services or select a location manually.'),
+          backgroundColor: Color(0xFFE92335),
+          duration: Duration(seconds: 3),
+        ),
+      );
     }
   }
 
@@ -4185,7 +4789,10 @@ class MapScreen extends StatefulWidget {
 class _MapScreenState extends State<MapScreen> {
   final fmap.MapController _mapController = fmap.MapController();
   bool _loadingLocation = false;
+  bool _tilesFailed = false;
   ll.LatLng? _currentPosition;
+  String _addressLabel = 'Resolving address…';
+  String _metadata = '';
 
   @override
   void initState() {
@@ -4202,16 +4809,51 @@ class _MapScreenState extends State<MapScreen> {
     _useCurrentLocation();
   }
 
+  /// One-shot refresh used by both the initial load and the Recenter FAB.
   Future<void> _useCurrentLocation() async {
     if (_loadingLocation) return;
     setState(() => _loadingLocation = true);
-    final loc = await LiveLocationService.getCurrentPosition();
-    if (loc != null && mounted) {
-      final current = ll.LatLng(loc.latitude, loc.longitude);
-      setState(() { _currentPosition = current; });
-      try { _mapController.move(current, 15.0); } catch (_) {}
+    try {
+      final result = await LiveLocationService.getCurrentPositionWithSource();
+      if (result != null && mounted) {
+        LiveLocationService.lastSource = result.source;
+        LiveLocationService.lastAccuracyMeters = result.accuracyMeters;
+        LiveLocationService.lastUpdateTime = result.timestamp;
+        final current = ll.LatLng(
+          result.position.latitude,
+          result.position.longitude,
+        );
+        setState(() {
+          _currentPosition = current;
+          _metadata = result.sourceLabel +
+              (result.accuracyMeters != null
+                  ? ' · ±${result.accuracyMeters!.round()}m'
+                  : '');
+        });
+        try {
+          _mapController.move(current, 15.0);
+        } catch (_) {}
+        final info = await lookupAddress(result.position);
+        if (mounted) {
+          setState(() => _addressLabel = info.displayFor(result.position));
+        }
+      } else if (mounted) {
+        setState(() {
+          _metadata = 'NO LOCATION — enable GPS / grant permission';
+          _addressLabel = 'Address unavailable';
+        });
+        if (LiveLocationService.customSelectedPosition == null) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('No real device location available. Map not moved.'),
+              backgroundColor: Color(0xFFE92335),
+            ),
+          );
+        }
+      }
+    } finally {
+      if (mounted) setState(() => _loadingLocation = false);
     }
-    if (mounted) setState(() => _loadingLocation = false);
   }
 
   void _showResponderDetails(Responder r) {
@@ -4305,12 +4947,14 @@ class _MapScreenState extends State<MapScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // Use Cairo centre as fallback when GPS hasn't resolved yet
-    final effectiveLocation = _currentPosition ?? const ll.LatLng(30.0444, 31.2357);
-    final responders = _getRespondersForLocation(toGMap(effectiveLocation));
-    final areaLabel = _currentPosition != null
-        ? getAreaName(LatLng(_currentPosition!.latitude, _currentPosition!.longitude))
-        : 'Cairo, Egypt';
+    // Never render a map centred on hardcoded coordinates.
+    final hasLocation = _currentPosition != null;
+    final responders = hasLocation
+        ? _getRespondersForLocation(
+            LatLng(_currentPosition!.latitude, _currentPosition!.longitude))
+        : <Responder>[];
+    final areaLabel =
+        hasLocation ? _addressLabel : 'Waiting for real device location…';
 
     return Scaffold(
       backgroundColor: const Color(0xFFFFF9FA),
@@ -4328,8 +4972,13 @@ class _MapScreenState extends State<MapScreen> {
               context,
               onUseCurrentLocation: _useCurrentLocation,
               onLocationSelected: (loc, label) {
+                LiveLocationService.setCustomLocation(loc, label: label);
                 final llLoc = ll.LatLng(loc.latitude, loc.longitude);
-                setState(() { _currentPosition = llLoc; });
+                setState(() {
+                  _currentPosition = llLoc;
+                  _addressLabel = label;
+                  _metadata = 'MANUAL SELECTION (not live GPS)';
+                });
                 try { _mapController.move(llLoc, 15.0); } catch (_) {}
               },
             ),
@@ -4380,16 +5029,51 @@ class _MapScreenState extends State<MapScreen> {
       ),
       body: Stack(
         children: [
-          fmap.FlutterMap(
+          if (!hasLocation)
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.all(32),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.gps_off_rounded,
+                        size: 64, color: Color(0xFFB0B6BA)),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'No real location yet.\nEnable GPS or grant permission to show the map.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Color(0xFF777E82), fontSize: 14),
+                    ),
+                    const SizedBox(height: 16),
+                    ElevatedButton.icon(
+                      onPressed: _useCurrentLocation,
+                      style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFFE92335),
+                          foregroundColor: Colors.white),
+                      icon: const Icon(Icons.refresh_rounded),
+                      label: const Text('Refresh location'),
+                    ),
+                  ],
+                ),
+              ),
+            )
+          else
+            fmap.FlutterMap(
             mapController: _mapController,
             options: fmap.MapOptions(
-              initialCenter: effectiveLocation,
+              initialCenter: _currentPosition!,
               initialZoom: 14.5,
             ),
             children: [
               fmap.TileLayer(
                 urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                 userAgentPackageName: 'com.example.emergency_help',
+                evictErrorTileStrategy: fmap.EvictErrorTileStrategy.notVisibleRespectMargin,
+                errorTileCallback: (_, __, ___) {
+                  if (mounted && !_tilesFailed) {
+                    setState(() => _tilesFailed = true);
+                  }
+                },
               ),
               fmap.MarkerLayer(
                 markers: [
@@ -4470,39 +5154,91 @@ class _MapScreenState extends State<MapScreen> {
               ),
             ],
           ),
-          // GPS location chip (top-left)
+          // GPS location chip (top-left) — address, coordinates, source and accuracy
           Positioned(
             left: 16,
             top: 16,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(16),
-                boxShadow: [
-                  BoxShadow(color: Colors.black.withOpacity(.10), blurRadius: 12,
-                      offset: const Offset(0, 4)),
-                ],
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.location_on_rounded, color: Color(0xFFE92335), size: 19),
-                  const SizedBox(width: 7),
-                  Text(
-                    _loadingLocation ? 'Detecting...' : areaLabel,
-                    style: const TextStyle(fontWeight: FontWeight.w800, color: Color(0xFF202329), fontSize: 12),
-                  ),
-                ],
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 260),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(16),
+                  boxShadow: [
+                    BoxShadow(color: Colors.black.withOpacity(.10), blurRadius: 12,
+                        offset: const Offset(0, 4)),
+                  ],
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.location_on_rounded, color: Color(0xFFE92335), size: 19),
+                    const SizedBox(width: 7),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            _loadingLocation ? 'Detecting...' : areaLabel,
+                            style: const TextStyle(fontWeight: FontWeight.w800,
+                                color: Color(0xFF202329), fontSize: 12),
+                          ),
+                          if (_currentPosition != null) ...[
+                            const SizedBox(height: 2),
+                            Text(
+                              '${_currentPosition!.latitude.toStringAsFixed(4)}, '
+                              '${_currentPosition!.longitude.toStringAsFixed(4)}',
+                              style: const TextStyle(
+                                  color: Color(0xFF777E82), fontSize: 10),
+                            ),
+                          ],
+                          if (_metadata.isNotEmpty)
+                            Text(_metadata,
+                                style: const TextStyle(
+                                    color: Color(0xFF20B66B),
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 10)),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
-          // Current location FAB
+          if (_tilesFailed)
+            Positioned(
+              left: 16,
+              top: 130,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.black87,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Text(
+                  'Map tiles unavailable offline — GPS still active',
+                  style: TextStyle(color: Colors.white, fontSize: 10),
+                ),
+              ),
+            ),
+          if (hasLocation)
+            const Positioned(
+              left: 8,
+              bottom: 8,
+              child: Text('© OpenStreetMap contributors',
+                  style: TextStyle(fontSize: 9, color: Color(0xFF777E82))),
+            ),
+          // Current location FAB — recenters on the latest real GPS fix
           Positioned(
             right: 16,
             bottom: 24,
             child: FloatingActionButton(
               heroTag: 'currentLocationButton',
+              tooltip: 'Recenter on live location',
               backgroundColor: Colors.white,
               foregroundColor: const Color(0xFFE92335),
               onPressed: _useCurrentLocation,
@@ -4605,8 +5341,16 @@ class _FindNearestScreenState extends State<FindNearestScreen>
     setState(() { _loading = true; _error = null; });
     final loc = await LiveLocationService.getCurrentPosition();
     if (!mounted) return;
-    // Always proceed — fallback to Cairo centre if GPS fails
-    _userLoc = loc ?? const LatLng(30.0444, 31.2357);
+    if (loc != null) {
+      _userLoc = loc;
+    } else {
+      // No GPS available — don't fake a location
+      setState(() {
+        _loading = false;
+        _error = 'GPS unavailable. Please enable location services\nor select a location manually.';
+      });
+      return;
+    }
     _findNearest();
   }
 
@@ -4728,7 +5472,7 @@ class _FindNearestScreenState extends State<FindNearestScreen>
                   const Icon(Icons.location_on_rounded, color: Color(0xFFE92335), size: 16),
                   const SizedBox(width: 6),
                   Text(
-                    getAreaName(_userLoc!),
+                    '${LiveLocationService.lastSourceLabel} · approx. ${getAreaName(_userLoc!)}',
                     style: const TextStyle(color: Colors.white70, fontSize: 12, fontWeight: FontWeight.w600),
                   ),
                   const Spacer(),
@@ -4798,10 +5542,21 @@ class _FindNearestScreenState extends State<FindNearestScreen>
                           ),
                         ),
                       )
-                    : fmap.FlutterMap(
+                    : _userLoc == null
+                        ? const Center(
+                            child: Padding(
+                              padding: EdgeInsets.all(32),
+                              child: Text(
+                                'No real device location available. Map is hidden instead of showing a fake location.',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(color: Colors.white70, fontSize: 14),
+                              ),
+                            ),
+                          )
+                        : fmap.FlutterMap(
                         mapController: _fmapCtrl,
                         options: fmap.MapOptions(
-                          initialCenter: _userLoc != null ? toLl(_userLoc!) : const ll.LatLng(30.0444, 31.2357),
+                          initialCenter: toLl(_userLoc!),
                           initialZoom: 14.5,
                         ),
                         children: [
